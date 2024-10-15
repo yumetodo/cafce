@@ -1,0 +1,5 @@
+paths = ["foo.txt"]
+fallback_keys = []
+
+[key]
+files = ["bar.txt"]
