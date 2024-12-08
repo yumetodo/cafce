@@ -7,4 +7,5 @@ edition = "2021"
 serde = { version = "1.0.215", features = ["derive"] }
 serde_either = "0.2.1"
 toml = "0.8.19"
+bpaf = { version = "0.9", features = ["derive", "autocomplete"] }
 envy = "0.4"
