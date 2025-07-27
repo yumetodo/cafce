@@ -2,7 +2,34 @@ pub struct HashCalculator;
 
 impl HashCalculator {
     pub fn calculate_files_hash(files: &[std::path::PathBuf]) -> anyhow::Result<String> {
-        unimplemented!()
+        use sha2::Digest;
+        
+        if files.is_empty() {
+            // 空のファイルリストの場合は空文字列のハッシュを返す
+            let mut hasher = sha2::Sha256::new();
+            hasher.update(b"");
+            let result = hasher.finalize();
+            return Ok(format!("{:x}", result));
+        }
+        
+        // ファイルパスでソートして一貫性を保つ
+        let mut sorted_files = files.to_vec();
+        sorted_files.sort();
+        
+        // 各ファイルのハッシュを計算
+        let mut file_hashes = std::vec::Vec::new();
+        for file in &sorted_files {
+            let file_hash = Self::calculate_single_file_hash(file)?;
+            file_hashes.push(format!("{}:{}", file.display(), file_hash));
+        }
+        
+        // すべてのファイルハッシュを結合して最終ハッシュを計算
+        let combined = file_hashes.join("\n");
+        let mut hasher = sha2::Sha256::new();
+        hasher.update(combined.as_bytes());
+        let result = hasher.finalize();
+        
+        Ok(format!("{:x}", result))
     }
 
     pub fn calculate_single_file_hash(file: &std::path::Path) -> anyhow::Result<String> {
@@ -83,11 +110,11 @@ mod tests {
     fn test_calculate_files_hash_empty() {
         let files = vec![];
 
-        // unimplemented!()なので現在はpanicする
-        let result = std::panic::catch_unwind(|| {
-            super::HashCalculator::calculate_files_hash(&files)
-        });
-        assert!(result.is_err());
+        let result = super::HashCalculator::calculate_files_hash(&files);
+        assert!(result.is_ok());
+        let hash = result.unwrap();
+        assert_eq!(hash.len(), 64); // SHA-256は64文字の16進数文字列
+        assert!(hash.chars().all(|c| c.is_ascii_hexdigit()));
     }
 
     #[test]
@@ -98,11 +125,11 @@ mod tests {
         
         let files = vec![temp_file];
 
-        // unimplemented!()なので現在はpanicする
-        let result = std::panic::catch_unwind(|| {
-            super::HashCalculator::calculate_files_hash(&files)
-        });
-        assert!(result.is_err());
+        let result = super::HashCalculator::calculate_files_hash(&files);
+        assert!(result.is_ok());
+        let hash = result.unwrap();
+        assert_eq!(hash.len(), 64); // SHA-256は64文字の16進数文字列
+        assert!(hash.chars().all(|c| c.is_ascii_hexdigit()));
     }
 
     #[test]
@@ -116,11 +143,11 @@ mod tests {
         
         let files = vec![temp_file1, temp_file2];
 
-        // unimplemented!()なので現在はpanicする
-        let result = std::panic::catch_unwind(|| {
-            super::HashCalculator::calculate_files_hash(&files)
-        });
-        assert!(result.is_err());
+        let result = super::HashCalculator::calculate_files_hash(&files);
+        assert!(result.is_ok());
+        let hash = result.unwrap();
+        assert_eq!(hash.len(), 64); // SHA-256は64文字の16進数文字列
+        assert!(hash.chars().all(|c| c.is_ascii_hexdigit()));
     }
 
     #[test]
@@ -136,14 +163,11 @@ mod tests {
         let files1 = vec![temp_file1.clone(), temp_file2.clone()];
         let files2 = vec![temp_file2, temp_file1];
 
-        // unimplemented!()なので現在はpanicする
-        let result1 = std::panic::catch_unwind(|| {
-            super::HashCalculator::calculate_files_hash(&files1)
-        });
-        let result2 = std::panic::catch_unwind(|| {
-            super::HashCalculator::calculate_files_hash(&files2)
-        });
-        assert!(result1.is_err());
-        assert!(result2.is_err());
+        let result1 = super::HashCalculator::calculate_files_hash(&files1);
+        let result2 = super::HashCalculator::calculate_files_hash(&files2);
+        
+        assert!(result1.is_ok());
+        assert!(result2.is_ok());
+        assert_eq!(result1.unwrap(), result2.unwrap());
     }
 }
