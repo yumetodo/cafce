@@ -6,7 +6,17 @@ impl HashCalculator {
     }
 
     pub fn calculate_single_file_hash(file: &std::path::Path) -> anyhow::Result<String> {
-        unimplemented!()
+        use anyhow::Context;
+        use sha2::Digest;
+        
+        let content = std::fs::read(file)
+            .with_context(|| format!("ファイルの読み込みに失敗しました: {}", file.display()))?;
+        
+        let mut hasher = sha2::Sha256::new();
+        hasher.update(&content);
+        let result = hasher.finalize();
+        
+        Ok(format!("{:x}", result))
     }
 }
 
@@ -18,11 +28,11 @@ mod tests {
         let temp_file = temp_dir.path().join("test.txt");
         std::fs::write(&temp_file, "test content").unwrap();
 
-        // unimplemented!()なので現在はpanicする
-        let result = std::panic::catch_unwind(|| {
-            super::HashCalculator::calculate_single_file_hash(&temp_file)
-        });
-        assert!(result.is_err());
+        let result = super::HashCalculator::calculate_single_file_hash(&temp_file);
+        assert!(result.is_ok());
+        let hash = result.unwrap();
+        assert_eq!(hash.len(), 64); // SHA-256は64文字の16進数文字列
+        assert!(hash.chars().all(|c| c.is_ascii_hexdigit()));
     }
 
     #[test]
@@ -35,15 +45,12 @@ mod tests {
         std::fs::write(&temp_file1, content).unwrap();
         std::fs::write(&temp_file2, content).unwrap();
 
-        // unimplemented!()なので現在はpanicする
-        let result1 = std::panic::catch_unwind(|| {
-            super::HashCalculator::calculate_single_file_hash(&temp_file1)
-        });
-        let result2 = std::panic::catch_unwind(|| {
-            super::HashCalculator::calculate_single_file_hash(&temp_file2)
-        });
-        assert!(result1.is_err());
-        assert!(result2.is_err());
+        let result1 = super::HashCalculator::calculate_single_file_hash(&temp_file1);
+        let result2 = super::HashCalculator::calculate_single_file_hash(&temp_file2);
+        
+        assert!(result1.is_ok());
+        assert!(result2.is_ok());
+        assert_eq!(result1.unwrap(), result2.unwrap());
     }
 
     #[test]
@@ -55,15 +62,12 @@ mod tests {
         std::fs::write(&temp_file1, "content1").unwrap();
         std::fs::write(&temp_file2, "content2").unwrap();
 
-        // unimplemented!()なので現在はpanicする
-        let result1 = std::panic::catch_unwind(|| {
-            super::HashCalculator::calculate_single_file_hash(&temp_file1)
-        });
-        let result2 = std::panic::catch_unwind(|| {
-            super::HashCalculator::calculate_single_file_hash(&temp_file2)
-        });
-        assert!(result1.is_err());
-        assert!(result2.is_err());
+        let result1 = super::HashCalculator::calculate_single_file_hash(&temp_file1);
+        let result2 = super::HashCalculator::calculate_single_file_hash(&temp_file2);
+        
+        assert!(result1.is_ok());
+        assert!(result2.is_ok());
+        assert_ne!(result1.unwrap(), result2.unwrap());
     }
 
     #[test]
@@ -71,10 +75,7 @@ mod tests {
         let temp_dir = tempfile::tempdir().unwrap();
         let nonexistent_file = temp_dir.path().join("nonexistent.txt");
 
-        // unimplemented!()なので現在はpanicする
-        let result = std::panic::catch_unwind(|| {
-            super::HashCalculator::calculate_single_file_hash(&nonexistent_file)
-        });
+        let result = super::HashCalculator::calculate_single_file_hash(&nonexistent_file);
         assert!(result.is_err());
     }
 
