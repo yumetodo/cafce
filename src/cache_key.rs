@@ -12,7 +12,20 @@ impl CacheKeyGenerator {
     }
 
     pub fn generate_key(&self, key_config: &crate::setting::Key) -> anyhow::Result<String> {
-        unimplemented!()
+        // FileMatcherを使ってパターンからファイルを解決
+        let file_matcher = crate::file_matcher::FileMatcher::with_max_files(self.max_files);
+        let matched_files = file_matcher.resolve_patterns(&key_config.files, &self.base_path)?;
+        
+        // HashCalculatorを使ってファイルのハッシュを計算
+        let files_hash = crate::hash_calculator::HashCalculator::calculate_files_hash(&matched_files)?;
+        
+        // プレフィックスがある場合は結合
+        let final_key = match &key_config.prefix {
+            Some(prefix) => format!("{}-{}", prefix, files_hash),
+            None => files_hash,
+        };
+        
+        Ok(final_key)
     }
 }
 
@@ -40,11 +53,11 @@ mod tests {
             prefix: None,
         };
 
-        // unimplemented!()なので現在はpanicする
-        let result = std::panic::catch_unwind(|| {
-            generator.generate_key(&key_config)
-        });
-        assert!(result.is_err());
+        let result = generator.generate_key(&key_config);
+        assert!(result.is_ok());
+        let key = result.unwrap();
+        assert_eq!(key.len(), 64); // SHA-256は64文字の16進数文字列
+        assert!(key.chars().all(|c| c.is_ascii_hexdigit()));
     }
 
     #[test]
@@ -61,11 +74,11 @@ mod tests {
             prefix: Some("my-prefix".to_string()),
         };
 
-        // unimplemented!()なので現在はpanicする
-        let result = std::panic::catch_unwind(|| {
-            generator.generate_key(&key_config)
-        });
-        assert!(result.is_err());
+        let result = generator.generate_key(&key_config);
+        assert!(result.is_ok());
+        let key = result.unwrap();
+        assert!(key.starts_with("my-prefix-"));
+        assert_eq!(key.len(), "my-prefix-".len() + 64); // プレフィックス + ハイフン + SHA-256
     }
 
     #[test]
@@ -83,11 +96,11 @@ mod tests {
             prefix: None,
         };
 
-        // unimplemented!()なので現在はpanicする
-        let result = std::panic::catch_unwind(|| {
-            generator.generate_key(&key_config)
-        });
-        assert!(result.is_err());
+        let result = generator.generate_key(&key_config);
+        assert!(result.is_ok());
+        let key = result.unwrap();
+        assert_eq!(key.len(), 64); // SHA-256は64文字の16進数文字列
+        assert!(key.chars().all(|c| c.is_ascii_hexdigit()));
     }
 
     #[test]
@@ -105,11 +118,11 @@ mod tests {
             prefix: None,
         };
 
-        // unimplemented!()なので現在はpanicする
-        let result = std::panic::catch_unwind(|| {
-            generator.generate_key(&key_config)
-        });
-        assert!(result.is_err());
+        let result = generator.generate_key(&key_config);
+        assert!(result.is_ok());
+        let key = result.unwrap();
+        assert_eq!(key.len(), 64); // SHA-256は64文字の16進数文字列
+        assert!(key.chars().all(|c| c.is_ascii_hexdigit()));
     }
 
     #[test]
@@ -123,11 +136,11 @@ mod tests {
             prefix: None,
         };
 
-        // unimplemented!()なので現在はpanicする
-        let result = std::panic::catch_unwind(|| {
-            generator.generate_key(&key_config)
-        });
-        assert!(result.is_err());
+        let result = generator.generate_key(&key_config);
+        assert!(result.is_ok());
+        let key = result.unwrap();
+        assert_eq!(key.len(), 64); // 空のファイルリストでもハッシュは生成される
+        assert!(key.chars().all(|c| c.is_ascii_hexdigit()));
     }
 
     #[test]
@@ -144,15 +157,12 @@ mod tests {
             prefix: None,
         };
 
-        // unimplemented!()なので現在はpanicする
-        let result1 = std::panic::catch_unwind(|| {
-            generator.generate_key(&key_config)
-        });
-        let result2 = std::panic::catch_unwind(|| {
-            generator.generate_key(&key_config)
-        });
-        assert!(result1.is_err());
-        assert!(result2.is_err());
+        let result1 = generator.generate_key(&key_config);
+        let result2 = generator.generate_key(&key_config);
+        
+        assert!(result1.is_ok());
+        assert!(result2.is_ok());
+        assert_eq!(result1.unwrap(), result2.unwrap());
     }
 
     #[test]
@@ -169,19 +179,15 @@ mod tests {
             prefix: None,
         };
 
-        // unimplemented!()なので現在はpanicする
-        let result1 = std::panic::catch_unwind(|| {
-            generator.generate_key(&key_config)
-        });
+        let result1 = generator.generate_key(&key_config);
         
         // ファイル内容を変更
         std::fs::write(temp_dir.path().join("test.txt"), "content2").unwrap();
         
-        let result2 = std::panic::catch_unwind(|| {
-            generator.generate_key(&key_config)
-        });
+        let result2 = generator.generate_key(&key_config);
         
-        assert!(result1.is_err());
-        assert!(result2.is_err());
+        assert!(result1.is_ok());
+        assert!(result2.is_ok());
+        assert_ne!(result1.unwrap(), result2.unwrap());
     }
 }

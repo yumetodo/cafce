@@ -15,11 +15,11 @@ mod tests {
             prefix: Some("cache-v1".to_string()),
         };
 
-        // unimplemented!()なので現在はpanicする
-        let result = std::panic::catch_unwind(|| {
-            generator.generate_key(&key_config)
-        });
-        assert!(result.is_err());
+        let result = generator.generate_key(&key_config);
+        assert!(result.is_ok());
+        let key = result.unwrap();
+        assert!(key.starts_with("cache-v1-"));
+        assert_eq!(key.len(), "cache-v1-".len() + 64); // プレフィックス + ハイフン + SHA-256
     }
 
     #[test]
@@ -36,11 +36,10 @@ mod tests {
         let matcher = cafce::file_matcher::FileMatcher::new();
         let patterns = vec!["**/package.json".to_string()];
         
-        // unimplemented!()なので現在はpanicする
-        let result = std::panic::catch_unwind(|| {
-            matcher.resolve_patterns(&patterns, temp_path)
-        });
-        assert!(result.is_err());
+        let result = matcher.resolve_patterns(&patterns, temp_path);
+        assert!(result.is_ok());
+        let files = result.unwrap();
+        assert_eq!(files.len(), 2); // ルートとネストしたディレクトリの両方
     }
 
     #[test]
@@ -54,11 +53,11 @@ mod tests {
         
         let files = vec![temp_file1, temp_file2];
         
-        // unimplemented!()なので現在はpanicする
-        let result = std::panic::catch_unwind(|| {
-            cafce::hash_calculator::HashCalculator::calculate_files_hash(&files)
-        });
-        assert!(result.is_err());
+        let result = cafce::hash_calculator::HashCalculator::calculate_files_hash(&files);
+        assert!(result.is_ok());
+        let hash = result.unwrap();
+        assert_eq!(hash.len(), 64); // SHA-256は64文字の16進数文字列
+        assert!(hash.chars().all(|c| c.is_ascii_hexdigit()));
     }
 
     #[test]
