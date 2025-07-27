@@ -1,5 +1,9 @@
 mod env;
 mod setting;
+mod error;
+mod file_matcher;
+mod hash_calculator;
+mod cache_key;
 use bpaf::*;
 use std::path::PathBuf;
 

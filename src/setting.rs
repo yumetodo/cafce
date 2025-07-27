@@ -7,8 +7,8 @@ use std::path::Path;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Key {
-    files: Vec<String>,
-    prefix: Option<String>,
+    pub files: Vec<String>,
+    pub prefix: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
