@@ -20,7 +20,48 @@ impl FileMatcher {
         patterns: &[String],
         base_path: &std::path::Path,
     ) -> anyhow::Result<std::vec::Vec<std::path::PathBuf>> {
-        unimplemented!()
+        use anyhow::Context;
+        
+        let mut all_files = std::collections::HashSet::new();
+        
+        for pattern in patterns {
+            // 相対パターンの場合はbase_pathと結合
+            let full_pattern = if std::path::Path::new(pattern).is_absolute() {
+                pattern.clone()
+            } else {
+                base_path.join(pattern).to_string_lossy().to_string()
+            };
+            
+            // globパターンでファイルを検索
+            let glob_result = glob::glob(&full_pattern)
+                .with_context(|| format!("パターンマッチングに失敗しました: {}", pattern))?;
+            
+            // OKの結果のみを取得し、ファイルのみをフィルタリング
+            for path in glob_result.filter_map(Result::ok) {
+                // ファイルのみを対象とし、ディレクトリは除外
+                if path.is_file() {
+                    // base_pathより外側のファイルは除外（セキュリティ対策）
+                    if path.starts_with(base_path) {
+                        all_files.insert(path);
+                    }
+                    // base_pathより外側のファイルは無視
+                }
+            }
+        }
+        
+        // ファイル数制限チェック
+        if all_files.len() > self.max_files {
+            return Err(crate::error::CacheKeyError::TooManyFiles {
+                count: all_files.len(),
+                limit: self.max_files,
+            }.into());
+        }
+        
+        // ソートして一貫性を保つ
+        let mut result: std::vec::Vec<std::path::PathBuf> = all_files.into_iter().collect();
+        result.sort();
+        
+        Ok(result)
     }
 }
 
@@ -62,11 +103,11 @@ mod tests {
         let matcher = super::FileMatcher::new();
         let patterns = vec!["test.txt".to_string()];
         
-        // unimplemented!()なので現在はpanicする
-        let result = std::panic::catch_unwind(|| {
-            matcher.resolve_patterns(&patterns, temp_path)
-        });
-        assert!(result.is_err());
+        let result = matcher.resolve_patterns(&patterns, temp_path);
+        assert!(result.is_ok());
+        let files = result.unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0], test_file);
     }
 
     #[test]
@@ -81,11 +122,12 @@ mod tests {
         let matcher = super::FileMatcher::new();
         let patterns = vec!["*.txt".to_string()];
         
-        // unimplemented!()なので現在はpanicする
-        let result = std::panic::catch_unwind(|| {
-            matcher.resolve_patterns(&patterns, temp_path)
-        });
-        assert!(result.is_err());
+        let result = matcher.resolve_patterns(&patterns, temp_path);
+        assert!(result.is_ok());
+        let files = result.unwrap();
+        assert_eq!(files.len(), 2);
+        // ソートされているはず
+        assert!(files[0].file_name().unwrap().to_str().unwrap() < files[1].file_name().unwrap().to_str().unwrap());
     }
 
     #[test]
@@ -101,11 +143,11 @@ mod tests {
         let matcher = super::FileMatcher::with_max_files(50);
         let patterns = vec!["*.txt".to_string()];
         
-        // unimplemented!()なので現在はpanicする
-        let result = std::panic::catch_unwind(|| {
-            matcher.resolve_patterns(&patterns, temp_path)
-        });
+        let result = matcher.resolve_patterns(&patterns, temp_path);
         assert!(result.is_err());
+        // TooManyFilesエラーかどうか確認
+        let error = result.unwrap_err();
+        assert!(error.to_string().contains("ファイル数が制限を超えています"));
     }
 
     #[test]
@@ -116,11 +158,10 @@ mod tests {
         let matcher = super::FileMatcher::new();
         let patterns = vec!["nonexistent.txt".to_string()];
         
-        // unimplemented!()なので現在はpanicする
-        let result = std::panic::catch_unwind(|| {
-            matcher.resolve_patterns(&patterns, temp_path)
-        });
-        assert!(result.is_err());
+        let result = matcher.resolve_patterns(&patterns, temp_path);
+        assert!(result.is_ok());
+        let files = result.unwrap();
+        assert_eq!(files.len(), 0); // 存在しないファイルは無視される（GitLab CI互換）
     }
 
     #[test]
@@ -136,10 +177,10 @@ mod tests {
         let matcher = super::FileMatcher::new();
         let patterns = vec!["**/package.json".to_string()];
         
-        // unimplemented!()なので現在はpanicする
-        let result = std::panic::catch_unwind(|| {
-            matcher.resolve_patterns(&patterns, temp_path)
-        });
-        assert!(result.is_err());
+        let result = matcher.resolve_patterns(&patterns, temp_path);
+        assert!(result.is_ok());
+        let files = result.unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0], nested_dir.join("package.json"));
     }
 }
