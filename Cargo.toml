@@ -9,3 +9,8 @@ serde_either = "0.2.1"
 toml = "0.8.19"
 bpaf = { version = "0.9", features = ["derive", "autocomplete"] }
 envy = "0.4"
+aws-sdk-s3 = "1.69"
+aws-sdk-sts = "1.55"
+aws-config = { version = "1.5", features = ["behavior-version-latest"] }
+url = "2.5"
+thiserror = "2.0"

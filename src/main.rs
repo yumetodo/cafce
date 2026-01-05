@@ -1,5 +1,6 @@
 mod env;
 mod setting;
+mod s3_client;
 use bpaf::*;
 use std::path::PathBuf;
 
