@@ -66,6 +66,21 @@ mod tests {
     }
 
     #[test]
+    fn test_calculate_single_file_hash_known_value() {
+        // アルゴリズムが誤ってSHA-1やMD5等に差し替わった際に検出するための
+        // 既知値による回帰テスト（`printf 'test content' | sha256sum`で計算）
+        let temp_dir = tempfile::tempdir().unwrap();
+        let temp_file = temp_dir.path().join("test.txt");
+        std::fs::write(&temp_file, "test content").unwrap();
+
+        let result = super::HashCalculator::calculate_single_file_hash(&temp_file);
+        assert_eq!(
+            result.unwrap(),
+            "6ae8a75555209fd6c44157c0aed8016e763ff435a19cf186f76863140143ff72"
+        );
+    }
+
+    #[test]
     fn test_calculate_single_file_hash_same_content() {
         let temp_dir = tempfile::tempdir().unwrap();
         let temp_file1 = temp_dir.path().join("test1.txt");
@@ -151,6 +166,21 @@ mod tests {
         let hash = result.unwrap();
         assert_eq!(hash.len(), 64); // SHA-256は64文字の16進数文字列
         assert!(hash.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn test_calculate_files_hash_known_value() {
+        // 単一ファイルの内容ハッシュを16進文字列として結合し、
+        // さらにSHA-256をとった値との一致を確認する回帰テスト
+        let temp_dir = tempfile::tempdir().unwrap();
+        let temp_file = temp_dir.path().join("test.txt");
+        std::fs::write(&temp_file, "test content").unwrap();
+
+        let result = super::HashCalculator::calculate_files_hash(&[temp_file]);
+        assert_eq!(
+            result.unwrap(),
+            "4b9054a7a40e53c2e310fcd6f696c46c6a40dcdfa5b849785a456756ec512660"
+        );
     }
 
     #[test]
