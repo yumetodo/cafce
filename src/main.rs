@@ -1,6 +1,10 @@
 mod env;
 mod setting;
 mod s3_client;
+mod error;
+mod file_matcher;
+mod hash_calculator;
+mod cache_key;
 use bpaf::*;
 use std::path::PathBuf;
 
@@ -33,16 +37,16 @@ fn main() {
         Action::Store { config } => {
             let environment = env::Env::new().unwrap();
             let setting = setting::Setting::new_from_file(&config).unwrap();
-            println!("{:#?}", config);
-            println!("{:#?}", environment);
-            println!("{:#?}", setting);
+            println!("{config:#?}");
+            println!("{environment:#?}");
+            println!("{setting:#?}");
         }
         Action::Restore { config } => {
             let environment = env::Env::new().unwrap();
             let setting = setting::Setting::new_from_file(&config).unwrap();
-            println!("{:#?}", config);
-            println!("{:#?}", environment);
-            println!("{:#?}", setting);
+            println!("{config:#?}");
+            println!("{environment:#?}");
+            println!("{setting:#?}");
         }
     }
 }

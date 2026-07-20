@@ -14,3 +14,9 @@ aws-sdk-sts = "1.55"
 aws-config = { version = "1.5", features = ["behavior-version-latest"] }
 url = "2.5"
 thiserror = "2.0"
+anyhow = "1.0"
+glob = "0.3"
+sha2 = "0.10"
+
+[dev-dependencies]
+tempfile = "3.0"
