@@ -151,6 +151,27 @@ impl Env {
         self.aws_region.clone().unwrap_or_else(|| "us-east-1".to_string())
     }
 
+    /// AWSアクセスキーを取得する
+    ///
+    /// 未指定の場合はNone（SDK credential provider chainに委ねる）
+    pub fn access_key(&self) -> Option<&str> {
+        self.aws_access_key.as_deref()
+    }
+
+    /// AWSシークレットキーを取得する
+    ///
+    /// 未指定の場合はNone（SDK credential provider chainに委ねる）
+    pub fn secret_key(&self) -> Option<&str> {
+        self.aws_secret_key.as_deref()
+    }
+
+    /// AWSセッショントークンを取得する
+    ///
+    /// 未指定の場合はNone
+    pub fn session_token(&self) -> Option<&str> {
+        self.aws_session_token.as_deref()
+    }
+
     #[cfg(test)]
     pub(crate) fn new_for_test(
         server_address: Option<String>,

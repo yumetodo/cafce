@@ -1,5 +1,5 @@
 // src/s3_client.rs
-use aws_sdk_s3::config::Builder;
+use aws_sdk_s3::config::{Builder, Credentials, Region};
 use crate::env::Env;
 
 /// S3設定ビルダーに環境変数に基づく設定（エンドポイント、Path-style）を適用する
@@ -27,6 +27,40 @@ pub fn apply_s3_config(
     builder = builder.force_path_style(env.should_use_path_style());
 
     Ok(builder)
+}
+
+/// 環境変数設定に基づいてS3クライアントを構築する
+///
+/// - リージョンはenv.get_region()を使用してconfig loaderに設定する
+/// - aws_access_key/aws_secret_keyが両方とも設定されている場合のみ、
+///   静的クレデンシャルをcredentials_providerとして設定する
+///   （どちらか一方でも未設定の場合はSDKデフォルトのcredential provider chainに委ねる）
+/// - エンドポイント・Path-style設定はapply_s3_config()に委譲する
+///
+/// AssumeRole（aws_role_arn）、AWS Profile（aws_profile）、
+/// SDK provider chainの明示的なロード処理は今回のスコープ外（未実装）。
+pub async fn build_s3_client(env: &Env) -> Result<aws_sdk_s3::Client, crate::env::EndpointError> {
+    let shared_config = aws_config::defaults(aws_config::BehaviorVersion::latest())
+        .region(Region::new(env.get_region()))
+        .load()
+        .await;
+
+    let mut builder = Builder::from(&shared_config);
+
+    if let (Some(access_key), Some(secret_key)) = (env.access_key(), env.secret_key()) {
+        let credentials = Credentials::new(
+            access_key,
+            secret_key,
+            env.session_token().map(String::from),
+            None,
+            "cafce-static",
+        );
+        builder = builder.credentials_provider(credentials);
+    }
+
+    builder = apply_s3_config(builder, env)?;
+
+    Ok(aws_sdk_s3::Client::from_conf(builder.build()))
 }
 
 #[cfg(test)]
