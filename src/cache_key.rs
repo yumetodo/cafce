@@ -15,7 +15,13 @@ impl CacheKeyGenerator {
         // FileMatcherを使ってパターンからファイルを解決
         let file_matcher = crate::file_matcher::FileMatcher::with_max_files(self.max_files);
         let matched_files = file_matcher.resolve_patterns(&key_config.files, &self.base_path)?;
-        
+
+        // マッチが0件の場合、常に同じ固定ハッシュを返すと設定ミスと
+        // 検知できないため、エラーとして報告する
+        if matched_files.is_empty() {
+            return Err(crate::error::CacheKeyError::NoFilesMatched.into());
+        }
+
         // HashCalculatorを使ってファイルのハッシュを計算
         let files_hash = crate::hash_calculator::HashCalculator::calculate_files_hash(&matched_files)?;
         
@@ -129,18 +135,18 @@ mod tests {
     fn test_generate_key_no_matching_files() {
         let temp_dir = tempfile::tempdir().unwrap();
         let base_path = temp_dir.path().to_path_buf();
-        
+
         let generator = super::CacheKeyGenerator::new(50, base_path);
         let key_config = crate::setting::Key {
             files: vec!["nonexistent.txt".to_string()],
             prefix: None,
         };
 
+        // マッチが0件の場合、誤設定と区別できなくなるためエラーとする
         let result = generator.generate_key(&key_config);
-        assert!(result.is_ok());
-        let key = result.unwrap();
-        assert_eq!(key.len(), 64); // 空のファイルリストでもハッシュは生成される
-        assert!(key.chars().all(|c| c.is_ascii_hexdigit()));
+        assert!(result.is_err());
+        let error = result.unwrap_err();
+        assert!(error.to_string().contains("マッチするファイルがありません"));
     }
 
     #[test]
