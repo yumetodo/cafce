@@ -1,0 +1,53 @@
+# Local development stack: a single RustFS (https://github.com/rustfs/rustfs) instance.
+#
+# cafce itself is NOT part of this compose file: cafce runs on the host and talks to
+# RustFS over `localhost:9000`, so only the S3 API (and console) ports need to be
+# published to the host.
+#
+# Usage:
+#   docker compose up -d
+#   docker compose down -v   # also removes the named volume
+#
+# Suggested cafce-side environment variables (see src/env.rs / doc/20251231_s3_connect_design.md):
+#   CAFCE_AWS_SERVER_ADDRESS=localhost:9000
+#   CAFCE_AWS_ACCESS_KEY=cafce-dev-access-key
+#   CAFCE_AWS_SECRET_KEY=cafce-dev-secret-key
+#   CAFCE_AWS_INSECURE=true
+services:
+  rustfs:
+    # Pin the tag explicitly; `latest` is intentionally avoided.
+    # RustFS has not cut a stable 1.0.0 release yet, so this tracks the newest beta.
+    image: rustfs/rustfs:1.0.0-beta.10
+    container_name: cafce-dev-rustfs
+    security_opt:
+      - "no-new-privileges:true"
+    ports:
+      - "127.0.0.1:9000:9000" # S3 API
+      - "127.0.0.1:9001:9001" # Web console
+    environment:
+      # SNSD (Single-Node Single-Disk) mode: one plain directory, no `{0...3}` ellipsis expansion.
+      RUSTFS_VOLUMES: /data
+      RUSTFS_ADDRESS: 0.0.0.0:9000
+      RUSTFS_CONSOLE_ADDRESS: 0.0.0.0:9001
+      RUSTFS_CONSOLE_ENABLE: "true"
+      # Local-dev-only dummy credentials. NOT the RustFS defaults (rustfsadmin/rustfsadmin):
+      # beta.9+ fail-close security checks reject the shipped default credentials.
+      RUSTFS_ACCESS_KEY: cafce-dev-access-key
+      RUSTFS_SECRET_KEY: cafce-dev-secret-key
+      # No RUSTFS_TLS_PATH set -> plain HTTP, which also keeps the healthcheck on http://.
+    volumes:
+      # Named volume, not a bind mount: the container runs as uid/gid 10001 and a host
+      # bind mount would otherwise hit permission-denied errors on that non-root user.
+      - rustfs_data:/data
+    restart: unless-stopped
+    healthcheck:
+      # /health is the stable liveness endpoint; /health/ready is avoided here because of
+      # a known bug (rustfs/rustfs#2658) where it can return 200 even when unhealthy.
+      test: ["CMD", "sh", "-c", "curl -fsS http://127.0.0.1:9000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+volumes:
+  rustfs_data:

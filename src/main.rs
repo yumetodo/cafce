@@ -1,5 +1,6 @@
 mod env;
 mod setting;
+mod s3_client;
 mod error;
 mod file_matcher;
 mod hash_calculator;
