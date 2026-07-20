@@ -1,6 +1,20 @@
 // src/s3_client.rs
-use aws_sdk_s3::config::{Builder, Credentials, Region};
 use crate::env::Env;
+use aws_sdk_s3::config::{Builder, Credentials, Region};
+use std::time::SystemTime;
+
+/// S3クライアント構築時のエラー
+#[derive(Debug, thiserror::Error)]
+pub enum BuildClientError {
+    #[error(transparent)]
+    Endpoint(#[from] crate::env::EndpointError),
+    #[error("CAFCE_AWS_ROLE_ARNが指定されている場合、CAFCE_AWS_ACCESS_KEYとCAFCE_AWS_SECRET_KEYの指定が必須です")]
+    MissingAssumeRoleSourceCredentials,
+    #[error("AssumeRoleに失敗しました: {0}")]
+    AssumeRole(String),
+    #[error("AssumeRoleのレスポンスにクレデンシャルが含まれていません")]
+    AssumeRoleMissingCredentials,
+}
 
 /// S3設定ビルダーに環境変数に基づく設定（エンドポイント、Path-style）を適用する
 ///
@@ -29,25 +43,112 @@ pub fn apply_s3_config(
     Ok(builder)
 }
 
-/// 環境変数設定に基づいてS3クライアントを構築する
+/// STS AssumeRoleを実行して一時クレデンシャルを取得する
 ///
-/// - リージョンはenv.get_region()を使用してconfig loaderに設定する
-/// - aws_access_key/aws_secret_keyが両方とも設定されている場合のみ、
-///   静的クレデンシャルをcredentials_providerとして設定する
-///   （どちらか一方でも未設定の場合はSDKデフォルトのcredential provider chainに委ねる）
-/// - エンドポイント・Path-style設定はapply_s3_config()に委譲する
+/// `access_key`/`secret_key`をソースクレデンシャルとしてSTSクライアントを作成し、
+/// `assume_role`を実行する。取得した一時クレデンシャルはS3クライアント用の
+/// `Credentials`に変換して返す。
 ///
-/// AssumeRole（aws_role_arn）、AWS Profile（aws_profile）、
-/// SDK provider chainの明示的なロード処理は今回のスコープ外（未実装）。
-pub async fn build_s3_client(env: &Env) -> Result<aws_sdk_s3::Client, crate::env::EndpointError> {
-    let shared_config = aws_config::defaults(aws_config::BehaviorVersion::latest())
-        .region(Region::new(env.get_region()))
+/// # Arguments
+/// * `access_key` / `secret_key` - AssumeRoleのソースとなる静的クレデンシャル
+/// * `role_arn` - Assumeするロールのarn
+/// * `session_name` - AssumeRoleのセッション名（未指定時は"cafce-session"）
+/// * `region` - STSクライアントに設定するリージョン
+async fn assume_role(
+    access_key: &str,
+    secret_key: &str,
+    role_arn: &str,
+    session_name: Option<&str>,
+    region: &str,
+) -> Result<Credentials, BuildClientError> {
+    // STSクライアントを静的クレデンシャルで作成
+    let sts_config = aws_config::defaults(aws_config::BehaviorVersion::latest())
+        .credentials_provider(Credentials::new(
+            access_key,
+            secret_key,
+            None,
+            None,
+            "cafce-source",
+        ))
+        .region(Region::new(region.to_string()))
         .load()
         .await;
 
+    let sts_client = aws_sdk_sts::Client::new(&sts_config);
+
+    // AssumeRole実行
+    let response = sts_client
+        .assume_role()
+        .role_arn(role_arn)
+        .role_session_name(session_name.unwrap_or("cafce-session"))
+        .send()
+        .await
+        .map_err(|e| BuildClientError::AssumeRole(e.to_string()))?;
+
+    let creds = response
+        .credentials
+        .ok_or(BuildClientError::AssumeRoleMissingCredentials)?;
+
+    let expiration = SystemTime::try_from(creds.expiration).ok();
+
+    Ok(Credentials::new(
+        creds.access_key_id,
+        creds.secret_access_key,
+        Some(creds.session_token),
+        expiration,
+        "cafce-assumed-role",
+    ))
+}
+
+/// 環境変数設定に基づいてS3クライアントを構築する
+///
+/// - リージョンはenv.get_region()を使用してconfig loaderに設定する
+/// - 認証方式は以下の優先順位で決定する:
+///   1. `env.role_arn()`が指定されている場合、`env.access_key()`/`env.secret_key()`を
+///      ソースクレデンシャルとしてSTS AssumeRoleを実行し、一時クレデンシャルを使用する
+///      （ソースクレデンシャルが片方でも未設定の場合はエラー）
+///   2. `env.access_key()`/`env.secret_key()`が両方とも設定されている場合、
+///      静的クレデンシャルをcredentials_providerとして設定する
+///   3. それ以外の場合、`env.profile()`が指定されていればconfig loaderに
+///      プロファイル名を設定し、SDKにクレデンシャル解決を委ねる
+///      （未指定の場合はSDKデフォルトのcredential provider chainに委ねる）
+/// - エンドポイント・Path-style設定はapply_s3_config()に委譲する
+pub async fn build_s3_client(env: &Env) -> Result<aws_sdk_s3::Client, BuildClientError> {
+    let mut config_loader = aws_config::defaults(aws_config::BehaviorVersion::latest())
+        .region(Region::new(env.get_region()));
+
+    // AssumeRole・静的クレデンシャルのいずれでもない場合のみ、プロファイル名を設定する
+    // （プロファイルが指すクレデンシャル解決はSDKに任せる）
+    let uses_static_credentials = env.access_key().is_some() && env.secret_key().is_some();
+    if env.role_arn().is_none() && !uses_static_credentials {
+        if let Some(profile) = env.profile() {
+            config_loader = config_loader.profile_name(profile);
+        }
+    }
+
+    let shared_config = config_loader.load().await;
+
     let mut builder = Builder::from(&shared_config);
 
-    if let (Some(access_key), Some(secret_key)) = (env.access_key(), env.secret_key()) {
+    if let Some(role_arn) = env.role_arn() {
+        // AssumeRole: access_key/secret_keyをソースクレデンシャルとして使用
+        let (access_key, secret_key) = match (env.access_key(), env.secret_key()) {
+            (Some(access_key), Some(secret_key)) => (access_key, secret_key),
+            _ => return Err(BuildClientError::MissingAssumeRoleSourceCredentials),
+        };
+
+        let assumed_credentials = assume_role(
+            access_key,
+            secret_key,
+            role_arn,
+            env.role_session_name(),
+            &env.get_region(),
+        )
+        .await?;
+
+        builder = builder.credentials_provider(assumed_credentials);
+    } else if let (Some(access_key), Some(secret_key)) = (env.access_key(), env.secret_key()) {
+        // 静的クレデンシャル（MinIO向け / AWS直接接続）
         let credentials = Credentials::new(
             access_key,
             secret_key,
@@ -57,6 +158,7 @@ pub async fn build_s3_client(env: &Env) -> Result<aws_sdk_s3::Client, crate::env
         );
         builder = builder.credentials_provider(credentials);
     }
+    // それ以外はSDK credential provider chainに任せる（Profile指定済み、または自動検出）
 
     builder = apply_s3_config(builder, env)?;
 

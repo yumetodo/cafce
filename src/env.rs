@@ -172,6 +172,27 @@ impl Env {
         self.aws_session_token.as_deref()
     }
 
+    /// AssumeRole用のRole ARNを取得する
+    ///
+    /// 未指定の場合はNone（AssumeRoleを実行しない）
+    pub fn role_arn(&self) -> Option<&str> {
+        self.aws_role_arn.as_deref()
+    }
+
+    /// AssumeRoleのセッション名を取得する
+    ///
+    /// 未指定の場合はNone（呼び出し側で"cafce-session"等の既定値を使用する）
+    pub fn role_session_name(&self) -> Option<&str> {
+        self.aws_role_session_name.as_deref()
+    }
+
+    /// AWSプロファイル名を取得する
+    ///
+    /// 未指定の場合はNone（SDK credential provider chainに委ねる）
+    pub fn profile(&self) -> Option<&str> {
+        self.aws_profile.as_deref()
+    }
+
     #[cfg(test)]
     pub(crate) fn new_for_test(
         server_address: Option<String>,
