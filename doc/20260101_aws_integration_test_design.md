@@ -465,3 +465,11 @@ junit = { path = "target/nextest/ci/junit.xml" }
 - rstest + 設定ファイル分離方式を採用
 - GitHub Actions / ローカル実行の両方に対応する設計を策定
 - AWS事前条件を明確化
+
+### 2026-07-21
+
+- 実装は本ドキュメントで設計したrstest + config.tomlベースの構成ではなく、
+  `src/s3_client.rs`内に`#[ignore]`付き`#[tokio::test]`を直接追加し、環境変数
+  （`CAFCE_AWS_*`、`CAFCE_TEST_BUCKET`）を都度読み取る簡易な方式にした。
+  静的クレデンシャル・AssumeRole・AWS Profileの3パターンを実AWS S3に対して
+  検証済み。詳細はissue #2のコメント参照

@@ -750,6 +750,11 @@ mod tests {
 - `aws sso login` コマンド (IAM Identity Center SSO) 対応を確認・ドキュメント化
 - `url` crateを使用したエンドポイント生成ロジックに変更（IPv6対応、入力検証の改善）
 
+### 2026-07-21
+
+- ローカル開発用の疎通先としてMinIOではなくRustFSを採用した。MinIO OSS版のリポジトリが
+  2026年4月にアーカイブされ開発終了となったため。経緯の詳細はissue #2のコメント参照
+
 ### 2026-01-01
 
 - S3クライアント生成ロジックを `apply_s3_config()` と `build_s3_client()` に分離
