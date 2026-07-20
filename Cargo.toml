@@ -9,3 +9,10 @@ serde_either = "0.2.1"
 toml = "0.8.19"
 bpaf = { version = "0.9", features = ["derive", "autocomplete"] }
 envy = "0.4"
+anyhow = "1.0"
+glob = "0.3"
+sha2 = "0.10"
+thiserror = "1.0"
+
+[dev-dependencies]
+tempfile = "3.0"

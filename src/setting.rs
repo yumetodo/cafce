@@ -7,8 +7,8 @@ use std::path::Path;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Key {
-    files: Vec<String>,
-    prefix: Option<String>,
+    pub files: Vec<String>,
+    pub prefix: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -36,7 +36,7 @@ impl Setting {
         };
         let mut file = File::create(path)?;
         let toml = toml::to_string(&setting).unwrap();
-        write!(file, "{}", toml)?;
+        write!(file, "{toml}")?;
         file.flush()?;
         Ok(())
     }
