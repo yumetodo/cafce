@@ -147,3 +147,136 @@ mod tests {
         // IPアドレスのエンドポイント設定
     }
 }
+
+/// RustFS（ローカルS3互換サーバー）に対する疎通確認テスト。
+///
+/// このモジュールのテストは通常の`cargo test`実行ではスキップされる
+/// （`#[ignore]`指定）。実行するには、リポジトリルートの`docker-compose.yml`で
+/// RustFSを事前に起動しておく必要がある:
+///
+/// ```sh
+/// docker compose up -d
+/// cargo test rustfs_integration -- --ignored --nocapture
+/// ```
+///
+/// `docker compose down`（またはコンテナ停止）した状態で実行すると、
+/// エンドポイントへの接続に失敗してテストが失敗する。
+#[cfg(test)]
+mod rustfs_integration_tests {
+    use super::*;
+    use crate::env::Env;
+    use aws_sdk_s3::primitives::ByteStream;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    /// テスト間で衝突しないよう、現在時刻（ナノ秒）でバケット名をユニーク化する。
+    fn unique_bucket_name() -> String {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock is before UNIX_EPOCH")
+            .as_nanos();
+        format!("cafce-integration-test-{nanos}")
+    }
+
+    fn rustfs_test_env() -> Env {
+        Env::new_for_test(
+            Some("localhost:9000".to_string()),
+            Some("cafce-dev-access-key".to_string()),
+            Some("cafce-dev-secret-key".to_string()),
+            None,
+            None,
+            None,
+            None,
+            true,
+            None,
+            None,
+        )
+    }
+
+    /// docker-compose.ymlで起動したRustFSに対して、
+    /// バケット作成→オブジェクトアップロード→一覧確認→取得→削除→バケット削除
+    /// の一連の流れが正しく行えることを確認する。
+    ///
+    /// 実行方法:
+    ///   docker compose up -d
+    ///   cargo test rustfs_integration_smoke_test -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore]
+    async fn rustfs_integration_smoke_test() {
+        let env = rustfs_test_env();
+        let client = build_s3_client(&env)
+            .await
+            .expect("failed to build S3 client for RustFS");
+
+        let bucket = unique_bucket_name();
+        let key = "cafce-test.txt";
+        let content: &[u8] = b"hello from cafce";
+
+        // 1. create_bucket
+        client
+            .create_bucket()
+            .bucket(&bucket)
+            .send()
+            .await
+            .unwrap_or_else(|e| panic!("create_bucket({bucket}) failed: {e:?}"));
+
+        // 2. put_object
+        client
+            .put_object()
+            .bucket(&bucket)
+            .key(key)
+            .body(ByteStream::from_static(content))
+            .send()
+            .await
+            .unwrap_or_else(|e| panic!("put_object({bucket}/{key}) failed: {e:?}"));
+
+        // 3. list_objects_v2でキーが含まれることを確認
+        let list_resp = client
+            .list_objects_v2()
+            .bucket(&bucket)
+            .send()
+            .await
+            .unwrap_or_else(|e| panic!("list_objects_v2({bucket}) failed: {e:?}"));
+        let listed_keys: Vec<&str> = list_resp
+            .contents()
+            .iter()
+            .filter_map(|obj| obj.key())
+            .collect();
+        assert!(
+            listed_keys.contains(&key),
+            "expected key {key:?} to be listed in bucket {bucket}, got {listed_keys:?}"
+        );
+
+        // 4. get_objectで取得し、中身が一致することを確認
+        let get_resp = client
+            .get_object()
+            .bucket(&bucket)
+            .key(key)
+            .send()
+            .await
+            .unwrap_or_else(|e| panic!("get_object({bucket}/{key}) failed: {e:?}"));
+        let body = get_resp
+            .body
+            .collect()
+            .await
+            .expect("failed to collect get_object body")
+            .into_bytes();
+        assert_eq!(body.as_ref(), content, "downloaded content does not match uploaded content");
+
+        // 5. delete_object
+        client
+            .delete_object()
+            .bucket(&bucket)
+            .key(key)
+            .send()
+            .await
+            .unwrap_or_else(|e| panic!("delete_object({bucket}/{key}) failed: {e:?}"));
+
+        // 6. delete_bucket
+        client
+            .delete_bucket()
+            .bucket(&bucket)
+            .send()
+            .await
+            .unwrap_or_else(|e| panic!("delete_bucket({bucket}) failed: {e:?}"));
+    }
+}
