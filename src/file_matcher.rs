@@ -25,13 +25,15 @@ impl FileMatcher {
         let mut all_files = std::collections::HashSet::new();
         
         for pattern in patterns {
-            // 相対パターンの場合はbase_pathと結合
-            let full_pattern = if std::path::Path::new(pattern).is_absolute() {
-                pattern.clone()
-            } else {
-                base_path.join(pattern).to_string_lossy().to_string()
-            };
-            
+            // 絶対パスはカレントディレクトリより外側の探索につながるため拒否する
+            if std::path::Path::new(pattern).is_absolute() {
+                return Err(crate::error::CacheKeyError::AbsolutePathNotAllowed {
+                    pattern: pattern.clone(),
+                }
+                .into());
+            }
+            let full_pattern = base_path.join(pattern).to_string_lossy().to_string();
+
             // globパターンでファイルを検索
             let glob_result = glob::glob(&full_pattern)
                 .with_context(|| format!("パターンマッチングに失敗しました: {pattern}"))?;
@@ -162,6 +164,24 @@ mod tests {
         assert!(result.is_ok());
         let files = result.unwrap();
         assert_eq!(files.len(), 0); // 存在しないファイルは無視される（GitLab CI互換）
+    }
+
+    #[test]
+    fn test_resolve_patterns_absolute_pattern_rejected() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let temp_path = temp_dir.path();
+
+        let matcher = super::FileMatcher::new();
+        #[cfg(not(windows))]
+        let absolute_pattern = "/etc/passwd".to_string();
+        #[cfg(windows)]
+        let absolute_pattern = "C:\\Windows\\win.ini".to_string();
+        let patterns = vec![absolute_pattern];
+
+        let result = matcher.resolve_patterns(&patterns, temp_path);
+        assert!(result.is_err());
+        let error = result.unwrap_err();
+        assert!(error.to_string().contains("絶対パスのパターンは指定できません"));
     }
 
     #[test]

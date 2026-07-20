@@ -5,10 +5,13 @@ pub enum CacheKeyError {
     
     #[error("ファイルの読み込みに失敗しました: {path}")]
     FileReadError { path: std::path::PathBuf },
-    
+
     #[error("パターンマッチングに失敗しました: {pattern}")]
     PatternMatchError { pattern: String },
-    
+
     #[error("ハッシュ計算に失敗しました")]
     HashCalculationError,
+
+    #[error("絶対パスのパターンは指定できません: {pattern}")]
+    AbsolutePathNotAllowed { pattern: String },
 }
