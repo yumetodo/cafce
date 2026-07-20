@@ -32,7 +32,13 @@ impl FileMatcher {
                 }
                 .into());
             }
-            let full_pattern = base_path.join(pattern).to_string_lossy().to_string();
+            // base_pathに`[`や`*`などのglobメタ文字が含まれていても、
+            // それ自体はパターンとして解釈させない
+            let escaped_base_path = glob::Pattern::escape(&base_path.to_string_lossy());
+            let full_pattern = std::path::Path::new(&escaped_base_path)
+                .join(pattern)
+                .to_string_lossy()
+                .to_string();
 
             // globパターンでファイルを検索
             let glob_result = glob::glob(&full_pattern)
@@ -164,6 +170,24 @@ mod tests {
         assert!(result.is_ok());
         let files = result.unwrap();
         assert_eq!(files.len(), 0); // 存在しないファイルは無視される（GitLab CI互換）
+    }
+
+    #[test]
+    fn test_resolve_patterns_base_path_with_glob_meta_chars() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        // `[`, `]`はglobのcharacter classとして解釈されるメタ文字
+        let weird_dir = temp_dir.path().join("build[1]");
+        std::fs::create_dir_all(&weird_dir).unwrap();
+        std::fs::write(weird_dir.join("test.txt"), "content").unwrap();
+
+        let matcher = super::FileMatcher::new();
+        let patterns = vec!["test.txt".to_string()];
+
+        let result = matcher.resolve_patterns(&patterns, &weird_dir);
+        assert!(result.is_ok());
+        let files = result.unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0], weird_dir.join("test.txt"));
     }
 
     #[test]
