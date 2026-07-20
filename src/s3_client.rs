@@ -382,3 +382,281 @@ mod rustfs_integration_tests {
             .unwrap_or_else(|e| panic!("delete_bucket({bucket}) failed: {e:?}"));
     }
 }
+
+/// 実際のAWS S3に対する疎通確認テスト（静的クレデンシャル・AssumeRoleの2パターン）。
+///
+/// このモジュールのテストは通常の`cargo test`実行ではスキップされる
+/// （`#[ignore]`指定）。RustFS向けの`rustfs_integration_tests`とは完全に独立しており、
+/// 実際のAWSアカウント上に用意したテスト専用のS3バケット・IAMユーザー・IAMロールを使用する。
+///
+/// 事前に用意しておくAWSリソース:
+/// - テスト専用のS3バケット（既存のもの。テストはこのバケットの作成・削除は行わない）
+/// - IAMユーザー（アクセスキー/シークレットキー）。バケットに対する
+///   `s3:ListBucket`/`s3:GetObject`/`s3:PutObject`/`s3:DeleteObject`権限のみで良い
+///   （`s3:CreateBucket`/`s3:DeleteBucket`は不要）
+/// - 上記IAMユーザーからのみAssumeRole可能なIAMロール（同様の権限）
+///
+/// 実行に必要な環境変数:
+/// - `CAFCE_AWS_ACCESS_KEY` - IAMユーザーのアクセスキーID
+/// - `CAFCE_AWS_SECRET_KEY` - IAMユーザーのシークレットアクセスキー
+/// - `CAFCE_AWS_REGION` - バケットのリージョン（例: "ap-northeast-1"）
+/// - `CAFCE_TEST_BUCKET` - テスト対象のS3バケット名
+/// - `CAFCE_AWS_ROLE_ARN` - AssumeRoleテスト（`aws_assume_role_smoke_test`）でのみ必要
+///
+/// これらは`Env::new()`（プロセス全体の環境変数を読むenvy経由）ではなく、
+/// 各テスト関数内で明示的に環境変数を読み取り`Env::new_for_test(...)`で組み立てる。
+/// これにより、例えば静的クレデンシャルのテストが、実行環境にたまたま
+/// `CAFCE_AWS_ROLE_ARN`が残っていることでAssumeRole分岐に化けてしまう、
+/// といった実行環境依存の揺れを防ぐ。
+///
+/// 実行方法:
+/// ```sh
+/// export CAFCE_AWS_ACCESS_KEY=...
+/// export CAFCE_AWS_SECRET_KEY=...
+/// export CAFCE_AWS_REGION=ap-northeast-1
+/// export CAFCE_TEST_BUCKET=...
+/// export CAFCE_AWS_ROLE_ARN=arn:aws:iam::...:role/...  # AssumeRoleテストのみ必要
+/// cargo test aws_integration -- --ignored --nocapture
+/// ```
+#[cfg(test)]
+mod aws_integration_tests {
+    use super::*;
+    use crate::env::Env;
+    use aws_sdk_s3::primitives::ByteStream;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    /// テスト間で衝突しないよう、現在時刻（ナノ秒）でオブジェクトキーをユニーク化する。
+    ///
+    /// バケットは既存のものを使い回すため、RustFSテストの`unique_bucket_name()`とは異なり
+    /// ここではキー名の方をユニーク化する。
+    fn unique_object_key(prefix: &str) -> String {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock is before UNIX_EPOCH")
+            .as_nanos();
+        format!("{prefix}-{nanos}.txt")
+    }
+
+    /// 環境変数からアクセスキー・シークレットキー・リージョン・バケット名を読み取る。
+    ///
+    /// 未設定の場合は分かりやすいメッセージでpanicする（`#[ignore]`付きの手動実行テストのため）。
+    fn read_common_env() -> (String, String, String, String) {
+        let access_key = std::env::var("CAFCE_AWS_ACCESS_KEY").unwrap_or_else(|_| {
+            panic!(
+                "環境変数CAFCE_AWS_ACCESS_KEYが設定されていません。\
+                 AWS疎通確認テストの実行にはIAMユーザーのアクセスキーIDが必要です。"
+            )
+        });
+        let secret_key = std::env::var("CAFCE_AWS_SECRET_KEY").unwrap_or_else(|_| {
+            panic!(
+                "環境変数CAFCE_AWS_SECRET_KEYが設定されていません。\
+                 AWS疎通確認テストの実行にはIAMユーザーのシークレットアクセスキーが必要です。"
+            )
+        });
+        let region = std::env::var("CAFCE_AWS_REGION").unwrap_or_else(|_| {
+            panic!(
+                "環境変数CAFCE_AWS_REGIONが設定されていません。\
+                 テスト対象バケットのリージョン（例: ap-northeast-1）を指定してください。"
+            )
+        });
+        let bucket = std::env::var("CAFCE_TEST_BUCKET").unwrap_or_else(|_| {
+            panic!(
+                "環境変数CAFCE_TEST_BUCKETが設定されていません。\
+                 テスト専用に用意した既存のS3バケット名を指定してください。"
+            )
+        });
+        (access_key, secret_key, region, bucket)
+    }
+
+    /// 実際のAWS S3に対して、静的クレデンシャルでの疎通確認を行う。
+    ///
+    /// put_object -> list_objects_v2 -> get_object -> delete_object の一連の流れを、
+    /// 既存のテスト専用バケットに対して行う（create_bucket/delete_bucketは呼ばない。
+    /// IAMポリシーにバケット作成・削除権限が無いため）。
+    ///
+    /// 実行方法:
+    ///   export CAFCE_AWS_ACCESS_KEY=... CAFCE_AWS_SECRET_KEY=... \
+    ///          CAFCE_AWS_REGION=... CAFCE_TEST_BUCKET=...
+    ///   cargo test aws_static_credentials_smoke_test -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore]
+    async fn aws_static_credentials_smoke_test() {
+        let (access_key, secret_key, region, bucket) = read_common_env();
+
+        let env = Env::new_for_test(
+            None, // server_address: AWS S3のデフォルトエンドポイントを使う
+            Some(access_key),
+            Some(secret_key),
+            None, // session_token
+            None, // role_arn
+            None, // role_session_name
+            None, // profile
+            false,
+            Some(region),
+            None, // force_path_style: 自動判定でvirtual-hosted styleになるはず
+        );
+
+        let client = build_s3_client(&env)
+            .await
+            .expect("failed to build S3 client for AWS S3 (static credentials)");
+
+        let key = unique_object_key("cafce-static-test");
+        let content: &[u8] = b"hello from cafce (static credentials)";
+
+        // 1. put_object
+        client
+            .put_object()
+            .bucket(&bucket)
+            .key(&key)
+            .body(ByteStream::from_static(content))
+            .send()
+            .await
+            .unwrap_or_else(|e| panic!("put_object({bucket}/{key}) failed: {e:?}"));
+
+        // 2. list_objects_v2でキーが含まれることを確認
+        let list_resp = client
+            .list_objects_v2()
+            .bucket(&bucket)
+            .prefix(&key)
+            .send()
+            .await
+            .unwrap_or_else(|e| panic!("list_objects_v2({bucket}) failed: {e:?}"));
+        let listed_keys: Vec<&str> = list_resp
+            .contents()
+            .iter()
+            .filter_map(|obj| obj.key())
+            .collect();
+        assert!(
+            listed_keys.contains(&key.as_str()),
+            "expected key {key:?} to be listed in bucket {bucket}, got {listed_keys:?}"
+        );
+
+        // 3. get_objectで取得し、中身が一致することを確認
+        let get_resp = client
+            .get_object()
+            .bucket(&bucket)
+            .key(&key)
+            .send()
+            .await
+            .unwrap_or_else(|e| panic!("get_object({bucket}/{key}) failed: {e:?}"));
+        let body = get_resp
+            .body
+            .collect()
+            .await
+            .expect("failed to collect get_object body")
+            .into_bytes();
+        assert_eq!(
+            body.as_ref(),
+            content,
+            "downloaded content does not match uploaded content"
+        );
+
+        // 4. delete_object（後始末。create_bucket/delete_bucketは権限外のため呼ばない）
+        client
+            .delete_object()
+            .bucket(&bucket)
+            .key(&key)
+            .send()
+            .await
+            .unwrap_or_else(|e| panic!("delete_object({bucket}/{key}) failed: {e:?}"));
+    }
+
+    /// 実際のAWS S3に対して、AssumeRoleでの疎通確認を行う。
+    ///
+    /// CAFCE_AWS_ACCESS_KEY/CAFCE_AWS_SECRET_KEYをソースクレデンシャルとしてAssumeRoleを実行し、
+    /// 取得した一時クレデンシャルでput_object -> list_objects_v2 -> get_object -> delete_object
+    /// の一連の流れを確認する（create_bucket/delete_bucketは呼ばない）。
+    ///
+    /// 実行方法:
+    ///   export CAFCE_AWS_ACCESS_KEY=... CAFCE_AWS_SECRET_KEY=... \
+    ///          CAFCE_AWS_REGION=... CAFCE_TEST_BUCKET=... CAFCE_AWS_ROLE_ARN=...
+    ///   cargo test aws_assume_role_smoke_test -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore]
+    async fn aws_assume_role_smoke_test() {
+        let (access_key, secret_key, region, bucket) = read_common_env();
+        let role_arn = std::env::var("CAFCE_AWS_ROLE_ARN").unwrap_or_else(|_| {
+            panic!(
+                "環境変数CAFCE_AWS_ROLE_ARNが設定されていません。\
+                 AssumeRole疎通確認テストの実行にはAssumeRole対象のロールARNが必要です。"
+            )
+        });
+
+        let env = Env::new_for_test(
+            None, // server_address: AWS S3のデフォルトエンドポイントを使う
+            Some(access_key),
+            Some(secret_key),
+            None, // session_token
+            Some(role_arn),
+            None, // role_session_name
+            None, // profile
+            false,
+            Some(region),
+            None, // force_path_style
+        );
+
+        let client = build_s3_client(&env)
+            .await
+            .expect("failed to build S3 client for AWS S3 (AssumeRole)");
+
+        let key = unique_object_key("cafce-assumerole-test");
+        let content: &[u8] = b"hello from cafce (AssumeRole)";
+
+        // 1. put_object
+        client
+            .put_object()
+            .bucket(&bucket)
+            .key(&key)
+            .body(ByteStream::from_static(content))
+            .send()
+            .await
+            .unwrap_or_else(|e| panic!("put_object({bucket}/{key}) failed: {e:?}"));
+
+        // 2. list_objects_v2でキーが含まれることを確認
+        let list_resp = client
+            .list_objects_v2()
+            .bucket(&bucket)
+            .prefix(&key)
+            .send()
+            .await
+            .unwrap_or_else(|e| panic!("list_objects_v2({bucket}) failed: {e:?}"));
+        let listed_keys: Vec<&str> = list_resp
+            .contents()
+            .iter()
+            .filter_map(|obj| obj.key())
+            .collect();
+        assert!(
+            listed_keys.contains(&key.as_str()),
+            "expected key {key:?} to be listed in bucket {bucket}, got {listed_keys:?}"
+        );
+
+        // 3. get_objectで取得し、中身が一致することを確認
+        let get_resp = client
+            .get_object()
+            .bucket(&bucket)
+            .key(&key)
+            .send()
+            .await
+            .unwrap_or_else(|e| panic!("get_object({bucket}/{key}) failed: {e:?}"));
+        let body = get_resp
+            .body
+            .collect()
+            .await
+            .expect("failed to collect get_object body")
+            .into_bytes();
+        assert_eq!(
+            body.as_ref(),
+            content,
+            "downloaded content does not match uploaded content"
+        );
+
+        // 4. delete_object（後始末。create_bucket/delete_bucketは権限外のため呼ばない）
+        client
+            .delete_object()
+            .bucket(&bucket)
+            .key(&key)
+            .send()
+            .await
+            .unwrap_or_else(|e| panic!("delete_object({bucket}/{key}) failed: {e:?}"));
+    }
+}
