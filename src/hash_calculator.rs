@@ -20,7 +20,7 @@ impl HashCalculator {
         let mut file_hashes = std::vec::Vec::new();
         for file in &sorted_files {
             let file_hash = Self::calculate_single_file_hash(file)?;
-            file_hashes.push(format!("{}:{}", file.display(), file_hash));
+            file_hashes.push(file_hash);
         }
         
         // すべてのファイルハッシュを結合して最終ハッシュを計算
