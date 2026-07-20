@@ -36,7 +36,7 @@ impl Setting {
         };
         let mut file = File::create(path)?;
         let toml = toml::to_string(&setting).unwrap();
-        write!(file, "{}", toml)?;
+        write!(file, "{toml}")?;
         file.flush()?;
         Ok(())
     }

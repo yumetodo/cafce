@@ -76,7 +76,7 @@ mod tests {
     #[test]
     fn test_error_types() {
         let error = cafce::error::CacheKeyError::TooManyFiles { count: 60, limit: 50 };
-        let error_string = format!("{}", error);
+        let error_string = format!("{error}");
         assert!(error_string.contains("ファイル数が制限を超えています"));
         assert!(error_string.contains("60"));
         assert!(error_string.contains("50"));

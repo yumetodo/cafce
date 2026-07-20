@@ -34,7 +34,7 @@ impl FileMatcher {
             
             // globパターンでファイルを検索
             let glob_result = glob::glob(&full_pattern)
-                .with_context(|| format!("パターンマッチングに失敗しました: {}", pattern))?;
+                .with_context(|| format!("パターンマッチングに失敗しました: {pattern}"))?;
             
             // OKの結果のみを取得し、ファイルのみをフィルタリング
             for path in glob_result.filter_map(Result::ok) {
@@ -137,7 +137,7 @@ mod tests {
         
         // 制限を超える数のファイルを作成
         for i in 0..60 {
-            std::fs::write(temp_path.join(format!("test{}.txt", i)), "content").unwrap();
+            std::fs::write(temp_path.join(format!("test{i}.txt")), "content").unwrap();
         }
         
         let matcher = super::FileMatcher::with_max_files(50);

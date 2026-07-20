@@ -9,7 +9,7 @@ impl HashCalculator {
             let mut hasher = sha2::Sha256::new();
             hasher.update(b"");
             let result = hasher.finalize();
-            return Ok(format!("{:x}", result));
+            return Ok(format!("{result:x}"));
         }
         
         // ファイルパスでソートして一貫性を保つ
@@ -28,8 +28,8 @@ impl HashCalculator {
         let mut hasher = sha2::Sha256::new();
         hasher.update(combined.as_bytes());
         let result = hasher.finalize();
-        
-        Ok(format!("{:x}", result))
+
+        Ok(format!("{result:x}"))
     }
 
     pub fn calculate_single_file_hash(file: &std::path::Path) -> anyhow::Result<String> {
@@ -42,8 +42,8 @@ impl HashCalculator {
         let mut hasher = sha2::Sha256::new();
         hasher.update(&content);
         let result = hasher.finalize();
-        
-        Ok(format!("{:x}", result))
+
+        Ok(format!("{result:x}"))
     }
 }
 

@@ -36,16 +36,16 @@ fn main() {
         Action::Store { config } => {
             let environment = env::Env::new().unwrap();
             let setting = setting::Setting::new_from_file(&config).unwrap();
-            println!("{:#?}", config);
-            println!("{:#?}", environment);
-            println!("{:#?}", setting);
+            println!("{config:#?}");
+            println!("{environment:#?}");
+            println!("{setting:#?}");
         }
         Action::Restore { config } => {
             let environment = env::Env::new().unwrap();
             let setting = setting::Setting::new_from_file(&config).unwrap();
-            println!("{:#?}", config);
-            println!("{:#?}", environment);
-            println!("{:#?}", setting);
+            println!("{config:#?}");
+            println!("{environment:#?}");
+            println!("{setting:#?}");
         }
     }
 }

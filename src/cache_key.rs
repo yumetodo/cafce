@@ -21,7 +21,7 @@ impl CacheKeyGenerator {
         
         // プレフィックスがある場合は結合
         let final_key = match &key_config.prefix {
-            Some(prefix) => format!("{}-{}", prefix, files_hash),
+            Some(prefix) => format!("{prefix}-{files_hash}"),
             None => files_hash,
         };
         
