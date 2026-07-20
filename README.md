@@ -18,3 +18,20 @@ This problem leads the limitation that only 2 blob expression is allowed for cac
 According to this GitLab CI/CD maintainer's post, calculating the cache key from files is executed on the GitLab server.  And the limitation comes from the server-side performance issue.
 
 So, there is a simple solution that calculates the cache key on each CI job after executing git checkout.
+
+## Local development (RustFS)
+
+`docker-compose.yml` at the repo root starts a local [RustFS](https://github.com/rustfs/rustfs) instance (S3-compatible) for testing cafce's S3 client against:
+
+```sh
+docker compose up -d
+```
+
+Then point cafce at it via (see `src/env.rs`):
+
+```sh
+export CAFCE_AWS_SERVER_ADDRESS=localhost:9000
+export CAFCE_AWS_ACCESS_KEY=cafce-dev-access-key
+export CAFCE_AWS_SECRET_KEY=cafce-dev-secret-key
+export CAFCE_AWS_INSECURE=true
+```
