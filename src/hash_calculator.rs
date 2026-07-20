@@ -1,9 +1,12 @@
 pub struct HashCalculator;
 
 impl HashCalculator {
+    // 呼び出し元(FileMatcher)がソート済みのリストを渡す場合でも、
+    // このメソッド単体で呼ばれても結果が入力順序に依存しないよう、
+    // 常に自前でソートし直す契約とする
     pub fn calculate_files_hash(files: &[std::path::PathBuf]) -> anyhow::Result<String> {
         use sha2::Digest;
-        
+
         if files.is_empty() {
             // 空のファイルリストの場合は空文字列のハッシュを返す
             let mut hasher = sha2::Sha256::new();
@@ -11,7 +14,7 @@ impl HashCalculator {
             let result = hasher.finalize();
             return Ok(format!("{result:x}"));
         }
-        
+
         // ファイルパスでソートして一貫性を保つ
         let mut sorted_files = files.to_vec();
         sorted_files.sort();
