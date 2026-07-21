@@ -131,10 +131,10 @@ fallback_keys = []
 paths = []
 ```
 
-- `project` は必須。未指定または空文字は typed error で拒否
+- `project` は必須。未指定または空文字は `Setting::new_from_*` 内でバリデーションし、typed error で拒否
 - `key` は `StringOrStruct<Key>` 型で literal / files-based の両形態を許容（既存構造を踏襲）
 - `paths` / `fallback_keys` は #6 では未使用。パースは通すが読み捨てる。空配列がデフォルト
-- 未知のキーは serde のデフォルト挙動に任せる（無視 or 厳格チェックのどちらにするかは実装時に決定するが、typed error に載せられるよう `#[serde(deny_unknown_fields)]` を検討）
+- 未知のキーは **`#[serde(deny_unknown_fields)]` を有効化して拒否**する。cafce v0.1 段階では前方互換性を保つ user がおらず、user の typo を silent に無視することの実害の方が大きいため。将来 cafce v1.0 前後で semver 運用を明文化するタイミングで再考する
 
 ### 6.3 環境変数
 
@@ -367,6 +367,20 @@ pub mod probe;
 
 **判断**: 却下。**完全 silent** で運用する。将来 `--verbose` や `--strict` フラグの需要が具体化したら非破壊的に追加できる。
 
+### 代替案9: `#[serde(deny_unknown_fields)]` を有効化せず前方互換性を保つ
+
+**Pros**:
+- 将来 cafce に新しい field を追加した場合、その field を含む config を古い cafce が読んでも silent に無視されて動作する
+- user が「新しい config 形式を先に書いておく」運用ができる
+
+**Cons**:
+- user の typo（例: `fallbackkeys = [...]` と書く）が silent に無視され、意図と違う設定で動く
+- 今日 fallback_keys の挙動を GitLab に寄せた際、silent フォールバックによる cache 名前空間の意図せぬ相乗りを許容する判断をしたが、それは "GitLab 準拠" のための例外的な silent 許容であって、typo の silent 許容までを認めたわけではない
+- cafce v0.1 段階では前方互換性の恩恵を受ける user がいない
+- strict → loose への変更は非破壊、loose → strict への変更は破壊的。cheap な今のうちに strict にしておく方が後々の選択肢を広げる
+
+**判断**: 却下。**`deny_unknown_fields` を有効化**する。cafce v1.0 前後で semver 運用を明文化するタイミングで再考する。
+
 ## 8. Concerns (懸念事項)
 
 - **`Setting.fallback_keys` を書けるが動かない期間ができる**（#6 マージ後、#7 マージ前）
@@ -398,19 +412,30 @@ pub mod probe;
 
 ### テストの実施
 
+**基本方針**: 単体テストで「入力→出力」のロジックを網羅的に pin し、統合テストは「コマンドが呼べて期待どおりの経路で動く」ことに閉じる（stdout の中身検査は単体テスト側で行う）。特に stdout / stderr へ出す文字列を組み立てる処理は**pure function として `key` / `probe` モジュール内に切り出し**、その関数を単体テストで検証する。この分離により、bpaf の subcommand 配線とは独立に出力形式の regression を防げる。
+
 - **単体テスト**:
-  - `src/setting.rs`: TOML round-trip、必須フィールド欠落時のエラー、`StringOrStruct<Key>` の両形態、未使用フィールド (`paths`/`fallback_keys`) が空でもパース通ること
+  - `src/setting.rs`:
+    - `Setting::new_from_file` を TOML ファイル入力で駆動する。struct → TOML → struct の round-trip だけでなく、**user が手で書く想定の TOML 文字列**を入力にしたテストケースを積む
+    - 既存の `test/sample/setting.toml` を regression テストとして読み込み、期待の struct になることを assert（config フォーマットが暗黙に壊れることを検知）
+    - 有効ケース: literal String 形態 (`key = "static-key"`) / files-based 形態 (`[key] files = [...]`) / prefix 有無 / `paths` 空・非空 / `fallback_keys` 空・非空 / 全フィールド埋めた combined config
+    - パースエラー系: 不正 TOML 構文、`project` 欠落、`project = ""`、`key` 欠落、型不一致（`project = 123` 等）、未知フィールドを含む TOML（`#[serde(deny_unknown_fields)]` により拒否されること）、`Key.files` に絶対パス、存在しないファイルパス指定
+    - 実装者判断で `new_from_str(&str)` に相当する内部関数を切り出すか、tempfile ベースで直接 `new_from_file` を叩くかを選ぶ。どちらでも上記ケースは表現可能
   - `src/env.rs`: `CAFCE_AWS_BUCKET` の必須チェック、`CAFCE_S3_PREFIX` の任意性、末尾スラッシュの正規化
   - `src/cache_key.rs`: 既存の `test_generate_key_no_matching_files` を挙動変更に合わせて更新（`assert_eq!(result.unwrap(), "default")`、および prefix ありケース `"my-prefix-default"` の追加）
-  - `src/probe.rs`: オブジェクトキーの組み立てロジック（`prefix?/project/cache_key`）を単体でカバー。head_object の呼び出しはモックを使わず、rustfs 統合テストで代替
+  - `src/probe.rs`: オブジェクトキーの組み立てロジック（`prefix?/project/cache_key`）を pure function として切り出して単体でカバー。head_object の呼び出し自体は rustfs 統合テストで代替
+  - **出力形成関数の単体テスト**: `key` / `probe` サブコマンドが stdout / stderr に出す文字列を組み立てる pure function を切り出し、以下を単体テストで pin:
+    - `probe` の bool → `"true"` / `"false"` 文字列変換（`Debug` フォーマット依存にしない）
+    - `key` のキー文字列出力（改行の有無を含めて）
+    - エラー時 stderr メッセージが `display_logs.md` の記載と一致する
 
 - **統合テスト**:
-  - `tests/probe_integration.rs`（仮称）: rustfs に対して事前 `put_object` した状態で `probe` が `true` を返すこと、していない状態で `false` を返すこと
+  - `tests/probe_integration.rs`（仮称）: rustfs に対して事前 `put_object` した状態で `probe` が hit すること、していない状態で miss することを検証。**コマンドが例外なく実行完了できる**ことの確認までを主目的にし、stdout 文字列の詳細は単体テスト側で pin されているため深追いしない
   - #2 の `s3_client.rs` 内テストにならい、テストごとにユニークな bucket / project 名を使って衝突を避ける
   - 実 AWS 宛の統合テストは #6 では対象外（#2 の疎通確認で AWS 側の権限周りは既に確認済み）
 
 - **エラー経路テスト**:
-  - config パース失敗（`project` 欠落、`key` 欠落、絶対パス）
+  - 上記の setting.rs パースエラー系（`project` 欠落・空文字、`key` 欠落、絶対パス、未知フィールド）
   - env 欠落（`CAFCE_AWS_BUCKET` 未設定）
   - S3 リージョン不一致・認証失敗
 
@@ -465,3 +490,10 @@ pub mod probe;
 - `default` の文字列は **literal 固定**（config で override 可能にする機構は入れない、YAGNI）
 - 本挙動変更に伴い `src/cache_key.rs` のフォールバックロジックを実装、`src/error.rs` から `CacheKeyError::NoFilesMatched` バリアントを削除（dead code 化するため）
 - `probe` サブコマンドがフォールバック後のキー（`<prefix>-default`）に対する S3 存在確認になることを確認。初回実行時は false が返るのが自然な挙動であり、CI 側の store フェーズ（#7）で default キー配下に置くことで整合する
+- `Setting.project` の空文字バリデーションを `Setting::new_from_*` 内で行う決定（getter 側ではなくパース時点で拒否）
+- `#[serde(deny_unknown_fields)]` を有効化する決定。cafce v0.1 段階では前方互換性の恩恵がなく、typo silent 無視の被害の方が大きい。将来 semver 運用明文化時に再考する
+- テスト方針について user と議論:
+  - CLI 経由での stdout 中身検査は「やり過ぎ」。統合テストは "コマンドが呼べて期待経路で動く" レベルに閉じる
+  - 出力生成ロジックは pure function として切り出し、単体テストで pin する
+  - この分離により、bpaf の subcommand 配線と出力形式の regression を独立に検証できる
+- 既存 `test/sample/setting.toml` を setting.rs の単体テストに regression として組み込む方針を追加。#2/#3 で「TOML ファイル入力を直接使ったテスト」が薄かった点を今回で解消する
