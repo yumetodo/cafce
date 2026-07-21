@@ -193,15 +193,36 @@ paths = []
 **採用構文**: `${VAR}` のみ
 
 - `$VAR`（波括弧なし）はサポートしない（ambiguity 回避）
-- `\${VAR}` によるエスケープは要件が出てから検討（#6 スコープでは未実装）
+- `\${VAR}` によるエスケープは #6 では**未対応**（需要が具体化したら非破壊的に後付け可能）
 - 展開対象は全 env 変数（cafce が特定の変数名だけ拾うのではなく、`std::env::var` で解決）
-- 未定義変数への参照はエラー（silent に空文字にはしない）
+- **未定義変数**への参照はエラー（silent に空文字にはしない）
+- **定義済みだが値が空文字**の変数（`std::env::var` が `Ok("")` を返す場合）は展開処理としては**通す**（結果が空文字になるだけ）
+- **再帰展開はしない**（1 パス限り。展開結果に `${...}` が含まれても literal として扱う）
 
-**適用箇所**（実装は #7 と共に）:
-- `Setting.fallback_keys` の各要素
-- `Setting.key`（literal String 形態）と `Setting.key.prefix` に適用するかは open（Concerns 参照）
+**適用範囲の設計原則**:
 
-**#6 での配線**: fallback_keys 自体を使わないため、変数展開ロジックの実装も #7 に持ち越す。ただし本ドキュメントで syntax を確定させておくことで、#7 開始時の議論を省略する。
+「String 値が cache key の一部を構成するなら展開、ファイルシステムパスなら展開しない」というシンプルルールに則る。
+
+| フィールド | 展開 | 理由 |
+|---|---|---|
+| `Setting.project` | ✅ | namespace 部分。user が opt-in で env 由来の分離（例: `project = "${CI_PROJECT_ID}"`）を書きたいケースをサポート。auto-derivation の却下（6.2 参照）とは独立で、user 手書きの opt-in は許容する |
+| `Setting.key`（literal String 形態） | ✅ | cache key そのもの。GitLab 相当のブランチ別キー（例: `key = "cache-${CI_COMMIT_REF_SLUG}"`）が書ける |
+| `Setting.key.prefix` | ✅ | cache key の名前空間切り分け（例: `prefix = "deps-${CI_COMMIT_REF_SLUG}"`） |
+| `Setting.fallback_keys` の各要素 | ✅ | 完全一致列挙のため、ブランチ別 fallback を書くのに必須 |
+| `Setting.key.files` | ❌ | glob パターン。展開せず literal として `glob::glob` に渡す（`${` は glob のメタ文字ではないので、`${VAR}` を含むファイル名にも一応対応できる） |
+| `Setting.paths`（#7 で使用） | ❌ | ファイルパス。files と同じ扱い |
+
+**展開のタイミング**:
+
+`Setting::new_from_file`（or 相当）内で、TOML パース直後にfield-specific validation（`project = ""` 拒否等）と組み合わせて **一括展開**する（fail-fast）。
+
+- 展開自体のエラー（未定義変数参照）: `SettingError::UndefinedVariable { name }` のような typed error として区別可能に
+- 展開後の field validation エラー（例: 展開結果が `project = ""` になる）: field validation のエラーとして区別可能に
+
+**#6 での実装範囲**:
+
+- `project` / `key`(literal) / `Key.prefix` は #6 の `key` / `probe` サブコマンドで実際に使うため、**展開ロジックは #6 で実装する**
+- `fallback_keys` の各要素の展開もパース時に行う（値の利用（restore への配線）は #7 で行うが、パース時展開は #6 で完結させておくことで #7 の作業を軽くする）
 
 ### 6.7 GitLab / GitHub Actions からの参照点
 
@@ -388,12 +409,6 @@ pub mod probe;
   - 緩和策B: README / display_logs.md に「fallback_keys は #7 で有効化予定」と明記
   - どちらか選ぶ（実装時に決定）
 
-- **`Setting.key` の literal String 形態および `Setting.key.prefix` に `${VAR}` 展開を効かせるか**
-  - fallback_keys では必須（ブランチ別 fallback を書くため）
-  - primary key の literal / prefix でも同様の需要はある（例: ブランチ別 primary key）
-  - #6 では未配線でよいが、#7 での取り扱いを事前に整理しておかないと不整合が生じる
-  - 個人的な仮案: 展開対象は「TOML の String 型フィールド全て」だが、`Key.files` の各 glob パターンは展開しない（ファイルパスに `${...}` を書くのは病的なので）
-
 - **`CAFCE_AWS_BUCKET` 未設定時のエラーメッセージ**
   - `Env` パースが `envy::Error` を返すが、bucket は特に必須なので専用のエラーメッセージを付ける方が親切
   - 実装時に thiserror バリアントを追加する
@@ -497,3 +512,13 @@ pub mod probe;
   - 出力生成ロジックは pure function として切り出し、単体テストで pin する
   - この分離により、bpaf の subcommand 配線と出力形式の regression を独立に検証できる
 - 既存 `test/sample/setting.toml` を setting.rs の単体テストに regression として組み込む方針を追加。#2/#3 で「TOML ファイル入力を直接使ったテスト」が薄かった点を今回で解消する
+- `${VAR}` 展開の適用範囲を確定:
+  - 展開する: `project`, `key`(literal String 形態), `Key.prefix`, `fallback_keys`
+  - 展開しない: `Key.files`, `paths`（#7）
+  - 原則ルール: 「cache key の一部を構成する String なら展開、ファイルシステムパスなら展開しない」
+- 展開のタイミングは `Setting::new_from_file` 内で TOML パース直後に一括展開（fail-fast）
+- 未定義変数参照はエラー、定義済み空文字の展開結果は展開処理としては通す（downstream の field validation は独立に適用される）
+- 再帰展開なし（1 パス限り）、エスケープ `\${VAR}` は #6 では未対応
+- `Key.files` 内の `${...}` は展開せず literal として `glob::glob` に委ねる
+- `project` を展開対象に含める決定: user が opt-in で env 由来の namespace 分離を書きたいケースをサポート。以前 auto-derivation を却下した判断とは独立の話（自動導出は却下、user 手書き opt-in は許容）
+- `${VAR}` 展開ロジックは #6 で実装する（`project` / `key` / `prefix` が #6 で実際に使われるため）。`fallback_keys` のパース時展開も #6 で完結させ、値の利用は #7 で行う
