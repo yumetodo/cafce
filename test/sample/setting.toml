@@ -1,3 +1,4 @@
+project = "sample-project"
 paths = ["foo.txt"]
 fallback_keys = []
 
