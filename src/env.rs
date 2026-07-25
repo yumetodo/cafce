@@ -1,6 +1,7 @@
 use serde::Deserialize;
 use url::Url;
 
+/// エンドポイントURL生成時のエラー
 #[derive(Debug, thiserror::Error)]
 pub enum EndpointError {
     #[error("無効なサーバーアドレス: {0}")]
@@ -29,35 +30,48 @@ fn default_force_path_style() -> Option<bool> {
 
 #[derive(Deserialize, Debug)]
 pub struct Env {
-    /// S3互換サーバーのアドレス（例: "s3.amazonaws.com", "localhost:9000"）
+    /// S3互換サーバーのアドレス
+    /// 例: "s3.amazonaws.com", "localhost:9000", "10.200.1.157:9000"
+    /// 省略時: SDKデフォルト（AWS S3）
     aws_server_address: Option<String>,
 
     /// AWSアクセスキー（MinIO用、またはAssumeRoleのソースクレデンシャル）
+    /// 省略時: SDK credential provider chainを使用
     aws_access_key: Option<String>,
 
     /// AWSシークレットキー
     aws_secret_key: Option<String>,
 
-    /// AWSセッショントークン（一時認証用）
+    /// AWSセッショントークン（一時認証用、既にAssumeRole済みの場合など）
     aws_session_token: Option<String>,
 
     /// AssumeRole用のRole ARN
+    /// 指定時: aws_access_key/secret_keyをソースクレデンシャルとしてAssumeRoleを実行
+    /// 例: "arn:aws:iam::123456789012:role/my-role"
     aws_role_arn: Option<String>,
 
     /// AssumeRoleのセッション名
+    /// 省略時: "cafce-session"
     aws_role_session_name: Option<String>,
 
     /// AWSプロファイル名（~/.aws/config のプロファイル）
+    /// 例: "my-profile", "assume-role-profile"
+    /// プロファイル内でrole_arn設定があれば自動でAssumeRole
     aws_profile: Option<String>,
 
     /// httpを使用するか（true: http, false: https）
+    /// ローカルMinIOではtrueを推奨
     #[serde(default = "default_insecure")]
     aws_insecure: bool,
 
     /// AWSリージョン（省略時はus-east-1）
+    /// MinIOの場合は通常 "us-east-1" を使用
     aws_region: Option<String>,
 
     /// Path-styleを強制するか
+    /// None: 自動判定（amazonaws.comならfalse、それ以外はtrue）
+    /// Some(true): Path-style強制
+    /// Some(false): Virtual-hosted style強制
     #[serde(default = "default_force_path_style")]
     aws_force_path_style: Option<bool>,
 
@@ -95,19 +109,31 @@ impl Env {
         self.s3_prefix.as_deref()
     }
 
+    /// サーバーアドレスからエンドポイントURLを生成する
+    ///
+    /// - schemeはaws_insecureフラグで決定（true: http, false: https）
+    /// - 正規ポート（http:80, https:443）は省略
+    /// - aws_server_addressが未指定またはs3.amazonaws.comの場合はNone（SDK既定）
+    /// - IPv6アドレス（例: "[::1]:9000"）にも対応
     pub fn build_endpoint(&self) -> Result<Option<Url>, EndpointError> {
         let addr = match self.aws_server_address.as_ref() {
             Some(a) if !a.is_empty() => a,
             _ => return Ok(None),
         };
 
+        // "s3.amazonaws.com"の場合はエンドポイント指定不要（SDK既定に任せる）
         if addr == "s3.amazonaws.com" {
             return Ok(None);
         }
 
         let scheme = if self.aws_insecure { "http" } else { "https" };
+
+        // server_addressが "localhost:9000" や "[::1]:9000" のような形式の場合
+        // 仮のURLとして組み立ててパース（url crateがIPv6も正しく処理）
         let url_str = format!("{scheme}://{addr}");
         let url = Url::parse(&url_str)?;
+
+        // 正規ポートの場合はポートを省略したURLを返す
 
         let is_default_port = matches!(
             (url.scheme(), url.port()),
@@ -125,51 +151,82 @@ impl Env {
         }
     }
 
+    /// サーバーアドレスからホスト部分を取得する（Path-style判定用）
+    ///
+    /// IPv6アドレスの場合もホスト部分を正しく抽出
     fn get_host(&self) -> Option<String> {
         let addr = self.aws_server_address.as_ref()?;
         if addr.is_empty() {
             return None;
         }
+
+        // 仮のURLとしてパースしてホストを取得
         let url_str = format!("http://{addr}");
         Url::parse(&url_str).ok()?.host_str().map(|s| s.to_string())
     }
 
+    /// Path-styleを使用すべきか判定する
+    ///
+    /// - 明示的に指定されていればその値を使用
+    /// - 未指定の場合は自動判定:
+    ///   - aws_server_address未指定またはamazonaws.comを含む -> false (virtual-hosted style)
+    ///   - それ以外 -> true (path-style)
+    /// - get_host()を使用してIPv6アドレスからも正しくホスト部分を抽出
     pub fn should_use_path_style(&self) -> bool {
         if let Some(force) = self.aws_force_path_style {
             return force;
         }
         match self.get_host() {
             Some(host) => !host.to_ascii_lowercase().contains("amazonaws.com"),
-            None => false,
+            None => false, // SDKデフォルト（AWS S3）はvirtual-hosted
         }
     }
 
+    /// 使用するリージョンを取得する
     pub fn get_region(&self) -> String {
         self.aws_region
             .clone()
             .unwrap_or_else(|| "us-east-1".to_string())
     }
 
+    /// AWSアクセスキーを取得する
+    ///
+    /// 未指定の場合はNone（SDK credential provider chainに委ねる）
     pub fn access_key(&self) -> Option<&str> {
         self.aws_access_key.as_deref()
     }
 
+    /// AWSシークレットキーを取得する
+    ///
+    /// 未指定の場合はNone（SDK credential provider chainに委ねる）
     pub fn secret_key(&self) -> Option<&str> {
         self.aws_secret_key.as_deref()
     }
 
+    /// AWSセッショントークンを取得する
+    ///
+    /// 未指定の場合はNone
     pub fn session_token(&self) -> Option<&str> {
         self.aws_session_token.as_deref()
     }
 
+    /// AssumeRole用のRole ARNを取得する
+    ///
+    /// 未指定の場合はNone（AssumeRoleを実行しない）
     pub fn role_arn(&self) -> Option<&str> {
         self.aws_role_arn.as_deref()
     }
 
+    /// AssumeRoleのセッション名を取得する
+    ///
+    /// 未指定の場合はNone（呼び出し側で"cafce-session"等の既定値を使用する）
     pub fn role_session_name(&self) -> Option<&str> {
         self.aws_role_session_name.as_deref()
     }
 
+    /// AWSプロファイル名を取得する
+    ///
+    /// 未指定の場合はNone（SDK credential provider chainに委ねる）
     pub fn profile(&self) -> Option<&str> {
         self.aws_profile.as_deref()
     }
