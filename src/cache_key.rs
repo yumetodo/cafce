@@ -16,10 +16,13 @@ impl CacheKeyGenerator {
         let file_matcher = crate::file_matcher::FileMatcher::with_max_files(self.max_files);
         let matched_files = file_matcher.resolve_patterns(&key_config.files, &self.base_path)?;
 
-        // マッチが0件の場合、常に同じ固定ハッシュを返すと設定ミスと
-        // 検知できないため、エラーとして報告する
+        // マッチが0件の場合、GitLab CI互換のフォールバックキーを返す
         if matched_files.is_empty() {
-            return Err(crate::error::CacheKeyError::NoFilesMatched.into());
+            let fallback = match &key_config.prefix {
+                Some(prefix) => format!("{prefix}-default"),
+                None => "default".to_string(),
+            };
+            return Ok(fallback);
         }
 
         // HashCalculatorを使ってファイルのハッシュを計算
@@ -133,20 +136,40 @@ mod tests {
 
     #[test]
     fn test_generate_key_no_matching_files() {
+        // Arrange
         let temp_dir = tempfile::tempdir().unwrap();
         let base_path = temp_dir.path().to_path_buf();
-
         let generator = super::CacheKeyGenerator::new(50, base_path);
         let key_config = crate::setting::Key {
             files: vec!["nonexistent.txt".to_string()],
             prefix: None,
         };
 
-        // マッチが0件の場合、誤設定と区別できなくなるためエラーとする
+        // Act
         let result = generator.generate_key(&key_config);
-        assert!(result.is_err());
-        let error = result.unwrap_err();
-        assert!(error.to_string().contains("マッチするファイルがありません"));
+
+        // Assert: マッチが0件の場合、GitLab CI互換のフォールバックキー "default" を返す
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "default");
+    }
+
+    #[test]
+    fn test_generate_key_no_matching_files_with_prefix() {
+        // Arrange
+        let temp_dir = tempfile::tempdir().unwrap();
+        let base_path = temp_dir.path().to_path_buf();
+        let generator = super::CacheKeyGenerator::new(50, base_path);
+        let key_config = crate::setting::Key {
+            files: vec!["nonexistent.txt".to_string()],
+            prefix: Some("my-prefix".to_string()),
+        };
+
+        // Act
+        let result = generator.generate_key(&key_config);
+
+        // Assert: prefix ありの場合は "<prefix>-default" を返す（GitLab CI互換）
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "my-prefix-default");
     }
 
     #[test]
