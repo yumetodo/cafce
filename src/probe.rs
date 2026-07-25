@@ -1,5 +1,3 @@
-use anyhow::Context as _;
-
 /// S3オブジェクトキーを組み立てる
 ///
 /// レイアウト: `{prefix}/{project}/{cache_key}` (prefix なしは `{project}/{cache_key}`)
@@ -34,12 +32,15 @@ async fn check_key_exists(
         Err(SdkError::ServiceError(e)) if matches!(e.err(), HeadObjectError::NotFound(_)) => {
             Ok(false)
         }
-        Err(e) => Err(anyhow::anyhow!(e)).with_context(|| {
-            format!(
-                "S3 HeadObject に失敗しました (bucket={bucket}, key={object_key})\n\
-                 403 の場合は s3:ListBucket 権限を確認してください"
-            )
-        }),
+        Err(e) => {
+            use anyhow::Context as _;
+            Err(anyhow::anyhow!(e)).with_context(|| {
+                format!(
+                    "S3 HeadObject に失敗しました (bucket={bucket}, key={object_key})\n\
+                     403 の場合は s3:ListBucket 権限を確認してください"
+                )
+            })
+        }
     }
 }
 
@@ -54,15 +55,13 @@ pub async fn probe(
     client: &aws_sdk_s3::Client,
     base_path: &std::path::Path,
 ) -> anyhow::Result<bool> {
+    use anyhow::Context as _;
+
     let primary_key = setting
         .resolve_primary_key(base_path)
         .context("primary キーの計算に失敗しました")?;
 
-    let all_keys: Vec<String> = std::iter::once(primary_key)
-        .chain(setting.fallback_keys.iter().cloned())
-        .collect();
-
-    for cache_key in &all_keys {
+    for cache_key in std::iter::once(&primary_key).chain(setting.fallback_keys.iter()) {
         let object_key = build_object_key(env.s3_prefix(), &setting.project, cache_key);
         if check_key_exists(client, env.bucket(), &object_key).await? {
             return Ok(true);

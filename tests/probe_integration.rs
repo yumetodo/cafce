@@ -40,7 +40,28 @@ mod probe_integration_tests {
         }
     }
 
-    /// バケット作成→テスト実行→バケット削除のラッパー
+    /// バケット内の全オブジェクトを削除する（delete_bucket の前処理）
+    async fn delete_all_objects(client: &aws_sdk_s3::Client, bucket: &str) {
+        let list_resp = client
+            .list_objects_v2()
+            .bucket(bucket)
+            .send()
+            .await
+            .unwrap_or_else(|e| panic!("list_objects_v2({bucket}) failed: {e:?}"));
+
+        for obj in list_resp.contents() {
+            let key = obj.key().expect("S3 object key must not be None");
+            client
+                .delete_object()
+                .bucket(bucket)
+                .key(key)
+                .send()
+                .await
+                .unwrap_or_else(|e| panic!("delete_object({bucket}/{key}) failed: {e:?}"));
+        }
+    }
+
+    /// バケット作成→テスト実行→全オブジェクト削除→バケット削除のラッパー
     async fn with_bucket<F, Fut>(
         client: &aws_sdk_s3::Client,
         bucket: &str,
@@ -57,6 +78,9 @@ mod probe_integration_tests {
             .unwrap_or_else(|e| panic!("create_bucket({bucket}) failed: {e:?}"));
 
         f().await;
+
+        // 非空バケットは削除できないため、先にオブジェクトを全削除する
+        delete_all_objects(client, bucket).await;
 
         client
             .delete_bucket()
