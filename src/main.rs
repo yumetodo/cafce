@@ -53,6 +53,7 @@ enum Action {
 
 #[tokio::main]
 async fn main() -> std::process::ExitCode {
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
     match run(opts().run()).await {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(e) => {
