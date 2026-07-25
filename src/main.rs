@@ -1,16 +1,8 @@
-mod env;
-mod setting;
-mod s3_client;
-mod error;
-mod file_matcher;
-mod hash_calculator;
-mod cache_key;
-use bpaf::*;
-use std::path::PathBuf;
+use bpaf::Bpaf;
 
+/// Cache management tool for CI pipelines
 #[derive(Debug, Clone, Bpaf)]
-#[allow(dead_code)]
-#[bpaf(options)]
+#[bpaf(options, version)]
 struct Opts {
     #[bpaf(external)]
     action: Action,
@@ -18,35 +10,107 @@ struct Opts {
 
 #[derive(Debug, Clone, Bpaf)]
 enum Action {
+    /// Store files to the cache (not yet implemented)
     #[bpaf(command)]
-    Store { config: PathBuf },
+    Store {
+        /// Path to the configuration file
+        #[bpaf(positional("CONFIG"))]
+        config: std::path::PathBuf,
+    },
 
+    /// Restore files from the cache (not yet implemented)
     #[bpaf(command)]
-    Restore { config: PathBuf },
+    Restore {
+        /// Path to the configuration file
+        #[bpaf(positional("CONFIG"))]
+        config: std::path::PathBuf,
+    },
 
+    /// Initialize a new configuration file
     #[bpaf(command)]
-    Init { config: PathBuf },
+    Init {
+        /// Path to write the configuration file
+        #[bpaf(positional("CONFIG"))]
+        config: std::path::PathBuf,
+    },
+
+    /// Print the primary cache key computed from the configuration
+    #[bpaf(command)]
+    Key {
+        /// Path to the configuration file
+        #[bpaf(positional("CONFIG"))]
+        config: std::path::PathBuf,
+    },
+
+    /// Check whether the cache exists in S3 (outputs "true" or "false")
+    #[bpaf(command)]
+    Probe {
+        /// Path to the configuration file
+        #[bpaf(positional("CONFIG"))]
+        config: std::path::PathBuf,
+    },
 }
 
-fn main() {
-    let ops = opts().run();
-    match ops.action {
-        Action::Init { config } => {
-            setting::Setting::init_to_file(&config).unwrap();
+#[tokio::main]
+async fn main() -> std::process::ExitCode {
+    match run(opts().run()).await {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("{e:#}");
+            std::process::ExitCode::FAILURE
         }
+    }
+}
+
+async fn run(opts: Opts) -> anyhow::Result<()> {
+    use anyhow::Context as _;
+
+    match opts.action {
+        Action::Key { config } => {
+            let cwd = std::env::current_dir().context("カレントディレクトリの取得に失敗しました")?;
+            let setting = cafce::setting::Setting::new_from_file(&config)
+                .with_context(|| format!("設定ファイルの読み込みに失敗しました: {}", config.display()))?;
+            let key = setting
+                .resolve_primary_key(&cwd)
+                .context("primary キーの計算に失敗しました")?;
+            println!("{key}");
+        }
+
+        Action::Probe { config } => {
+            let cwd = std::env::current_dir().context("カレントディレクトリの取得に失敗しました")?;
+            let setting = cafce::setting::Setting::new_from_file(&config)
+                .with_context(|| format!("設定ファイルの読み込みに失敗しました: {}", config.display()))?;
+            let env = cafce::env::Env::new().context("環境変数の読み込みに失敗しました")?;
+            let client = cafce::s3_client::build_s3_client(&env)
+                .await
+                .context("S3 クライアントの構築に失敗しました")?;
+            let hit = cafce::probe::probe(&setting, &env, &client, &cwd).await?;
+            println!("{}", if hit { "true" } else { "false" });
+        }
+
+        Action::Init { config } => {
+            cafce::setting::Setting::init_to_file(&config)
+                .with_context(|| format!("設定ファイルの初期化に失敗しました: {}", config.display()))?;
+        }
+
         Action::Store { config } => {
-            let environment = env::Env::new().unwrap();
-            let setting = setting::Setting::new_from_file(&config).unwrap();
+            let env = cafce::env::Env::new().context("環境変数の読み込みに失敗しました")?;
+            let setting = cafce::setting::Setting::new_from_file(&config)
+                .with_context(|| format!("設定ファイルの読み込みに失敗しました: {}", config.display()))?;
             println!("{config:#?}");
-            println!("{environment:#?}");
+            println!("{env:#?}");
             println!("{setting:#?}");
         }
+
         Action::Restore { config } => {
-            let environment = env::Env::new().unwrap();
-            let setting = setting::Setting::new_from_file(&config).unwrap();
+            let env = cafce::env::Env::new().context("環境変数の読み込みに失敗しました")?;
+            let setting = cafce::setting::Setting::new_from_file(&config)
+                .with_context(|| format!("設定ファイルの読み込みに失敗しました: {}", config.display()))?;
             println!("{config:#?}");
-            println!("{environment:#?}");
+            println!("{env:#?}");
             println!("{setting:#?}");
         }
     }
+
+    Ok(())
 }

@@ -204,8 +204,8 @@ impl Env {
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn new_for_test_with_bucket(
+    #[doc(hidden)]
+    pub fn new_for_test_with_bucket(
         server_address: Option<String>,
         access_key: Option<String>,
         secret_key: Option<String>,
