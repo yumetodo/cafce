@@ -82,6 +82,17 @@ pub struct Env {
     s3_prefix: Option<String>,
 }
 
+fn normalize_s3_prefix(prefix: Option<String>) -> Option<String> {
+    prefix.and_then(|p| {
+        let trimmed = p.trim_end_matches('/').to_string();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed)
+        }
+    })
+}
+
 impl Env {
     pub fn new() -> Result<Self, EnvError> {
         let mut env = envy::prefixed("CAFCE_").from_env::<Env>()?;
@@ -90,11 +101,7 @@ impl Env {
             return Err(EnvError::MissingBucket);
         }
 
-        // 末尾スラッシュを正規化し、スラッシュのみなら None に
-        if let Some(prefix) = env.s3_prefix.as_mut() {
-            let trimmed = prefix.trim_end_matches('/').to_string();
-            env.s3_prefix = if trimmed.is_empty() { None } else { Some(trimmed) };
-        }
+        env.s3_prefix = normalize_s3_prefix(env.s3_prefix);
 
         Ok(env)
     }
@@ -362,6 +369,54 @@ mod tests {
 
             // Assert
             assert_eq!(prefix, None);
+        }
+
+        #[test]
+        fn test_prefix_trailing_slash_normalized() {
+            // Arrange
+            let input = Some("my-prefix/".to_string());
+
+            // Act
+            let result = normalize_s3_prefix(input);
+
+            // Assert
+            assert_eq!(result.as_deref(), Some("my-prefix"));
+        }
+
+        #[test]
+        fn test_prefix_multiple_trailing_slashes_normalized() {
+            // Arrange
+            let input = Some("my-prefix///".to_string());
+
+            // Act
+            let result = normalize_s3_prefix(input);
+
+            // Assert
+            assert_eq!(result.as_deref(), Some("my-prefix"));
+        }
+
+        #[test]
+        fn test_prefix_only_slashes_becomes_none() {
+            // Arrange
+            let input = Some("/".to_string());
+
+            // Act
+            let result = normalize_s3_prefix(input);
+
+            // Assert
+            assert_eq!(result, None);
+        }
+
+        #[test]
+        fn test_prefix_empty_string_becomes_none() {
+            // Arrange: envy は空文字の env var を Some("") として渡す
+            let input = Some("".to_string());
+
+            // Act
+            let result = normalize_s3_prefix(input);
+
+            // Assert
+            assert_eq!(result, None);
         }
     }
 
