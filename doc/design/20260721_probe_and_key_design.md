@@ -60,7 +60,7 @@ fallback キャッシュ（キー未ヒット時に代替キーを試す機構�
 - **config file フォーマットの確定**: TOML 形式で `project` を必須、`key`（literal String または `{files, prefix}`）を必須、`fallback_keys` は #6 の `probe` から使用、`paths` は #7 のために予約フィールドとして受け入れる
   成功指標: `Setting::new_from_file` が typed error でパースエラーを返し、単体テストで round-trip・パース失敗ケースをカバーできること
 
-- **`key` サブコマンドの実装**: config file を読み、CWD を base_path として `CacheKeyGenerator::generate_key` を呼び、結果を stdout に 1 行で出力する
+- **`key` サブコマンドの実装**: config file を読み、§6.5 で定義する共通解決経路で primary key を得て（literal String / files-based の両形態を吸収）、結果を stdout に 1 行で出力する
   成功指標: 同一の config・同一のファイル内容に対して同じキー文字列が出力されること（#3 の regression テストと整合）
 
 - **`probe` サブコマンドの実装**: `key` と同じ経路で primary key を計算し、`{prefix?}/{project}/<key>` のオブジェクトキーに対して primary → `Setting.fallback_keys` の各要素の順に `head_object` を発行、いずれか存在すれば `true`、全 miss なら `false` を stdout に出力する
@@ -327,7 +327,7 @@ pub mod probe;
 - どのファイルも存在しないケースは、#3 では `CacheKeyError::NoFilesMatched` エラーで中断していたが、本フェーズで**GitLab 準拠のフォールバックに変更**する:
   - prefix なし → `default`
   - prefix あり → `<prefix>-default`
-- フォールバック発生時に stderr/stdout への warning や info ログは**出さない**（silent）。ログを出さない代わりに、`key` / `probe` サブコマンドの通常出力（生成されたキー文字列そのもの、および probe 時の S3 パス）で状況が可視化されるため、debug 可能性は保たれる
+- フォールバック発生時に stderr/stdout への warning や info ログは**出さない**（silent）。ログを出さない代わりに、`key` サブコマンド経由で生成キー文字列（`default` / `<prefix>-default` になっていること）を確認できるため、debug 可能性は保たれる（`probe` は stdout に `true` / `false` しか出さないため debug 用途では `key` を使う）
 - `default` は literal 固定（config で override 可能にする機構は入れない）
 
 **戻り値型・エラー型の変更**:
@@ -636,3 +636,10 @@ pub mod probe;
   - **指摘5**: `head_object` の 403 (AccessDenied) の扱い → 403 は miss にせず error として stderr へ伝播・exit 非 0 で終了する仕様を §6.5 と §8 Concerns に明記。IAM 要件として `s3:GetObject` + `s3:ListBucket` の両方を README に書く方針（実装フェーズで対応）。silent auth failure による永続的 cache miss を防ぐため fail-fast を優先
   - **補足**: `project` セグメントは運用上の名前空間分離であってセキュリティ境界ではない旨を §6.4 に明記
   - user の追加判断: 403 は `s3:ListBucket` 権限が無くても cafce が動くように silent 化する方向は却下、fail-fast で落とす方針を採用。README に IAM 権限を proactive に書く A1 案
+
+### 2026-07-25
+
+- PR #11 のフォローアップレビュー nits を反映:
+  - §4 Goal の `key` サブコマンド説明が `CacheKeyGenerator::generate_key` を直接呼ぶ書きぶりだったため、§6.5 の共通解決経路経由で primary key を得る形に整合させた（literal String 形態でも同経路を通ることを明示）
+  - §6.10 のフォールバック挙動の debug 可能性説明で「probe 時の S3 パス」を根拠に挙げていたが、§6.5 で決めた通り `probe` の stdout は `true` / `false` のみで S3 パスは出さないため矛盾していた。`key` サブコマンド経由で生成キー文字列を確認する形に修正
+  - どちらも文書整合性の nits で、実装方針への影響なし
