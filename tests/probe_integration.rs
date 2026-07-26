@@ -9,9 +9,6 @@
 /// ```
 #[cfg(test)]
 mod probe_integration_tests {
-    use aws_sdk_s3::primitives::ByteStream;
-    use std::time::{SystemTime, UNIX_EPOCH};
-
     fn rustfs_env(bucket: &str) -> cafce::env::Env {
         cafce::env::Env::new_for_test_with_bucket(
             Some("localhost:9000".to_string()),
@@ -24,6 +21,8 @@ mod probe_integration_tests {
     }
 
     fn unique_name(prefix: &str) -> String {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("system clock is before UNIX_EPOCH")
@@ -96,7 +95,9 @@ mod probe_integration_tests {
             .put_object()
             .bucket(bucket)
             .key(key)
-            .body(ByteStream::from_static(b"cafce-probe-test"))
+            .body(aws_sdk_s3::primitives::ByteStream::from_static(
+                b"cafce-probe-test",
+            ))
             .send()
             .await
             .unwrap_or_else(|e| panic!("put_object({bucket}/{key}) failed: {e:?}"));
