@@ -450,6 +450,7 @@ mod tests {
             assert!(result.is_ok());
             let endpoint = result.unwrap();
             assert!(endpoint.is_some());
+            // 正規ポートは省略される
             assert_eq!(endpoint.unwrap().as_str(), "http://localhost/");
         }
 
@@ -460,6 +461,7 @@ mod tests {
             assert!(result.is_ok());
             let endpoint = result.unwrap();
             assert!(endpoint.is_some());
+            // 正規ポートは省略される
             assert_eq!(endpoint.unwrap().as_str(), "https://localhost/");
         }
 
@@ -479,6 +481,7 @@ mod tests {
             let result = env.build_endpoint();
             assert!(result.is_ok());
             let endpoint = result.unwrap();
+            // s3.amazonaws.comの場合はNone（SDK既定に任せる）
             assert!(endpoint.is_none());
         }
 
@@ -488,6 +491,7 @@ mod tests {
             let result = env.build_endpoint();
             assert!(result.is_ok());
             let endpoint = result.unwrap();
+            // server_address未指定の場合はNone
             assert!(endpoint.is_none());
         }
 
@@ -497,6 +501,7 @@ mod tests {
             let result = env.build_endpoint();
             assert!(result.is_ok());
             let endpoint = result.unwrap();
+            // 空文字の場合はNone
             assert!(endpoint.is_none());
         }
 
@@ -529,30 +534,35 @@ mod tests {
         #[test]
         fn test_should_use_path_style_auto_minio() {
             let env = create_test_env(Some("localhost:9000"), false, None, None);
+            // localhost はamazonaws.comを含まないため、path-style
             assert!(env.should_use_path_style());
         }
 
         #[test]
         fn test_should_use_path_style_auto_aws() {
             let env = create_test_env(Some("s3.amazonaws.com"), false, None, None);
+            // amazonaws.comを含むため、virtual-hosted style
             assert!(!env.should_use_path_style());
         }
 
         #[test]
         fn test_should_use_path_style_auto_aws_regional() {
             let env = create_test_env(Some("s3.ap-northeast-1.amazonaws.com"), false, None, None);
+            // amazonaws.comを含むため、virtual-hosted style
             assert!(!env.should_use_path_style());
         }
 
         #[test]
         fn test_should_use_path_style_none() {
             let env = create_test_env(None, false, None, None);
+            // server_address未指定の場合はfalse（SDKデフォルト）
             assert!(!env.should_use_path_style());
         }
 
         #[test]
         fn test_should_use_path_style_ipv6() {
             let env = create_test_env(Some("[::1]:9000"), false, None, None);
+            // IPv6アドレスはamazonaws.comを含まないため、path-style
             assert!(env.should_use_path_style());
         }
     }
@@ -578,6 +588,7 @@ mod tests {
                 aws_region: Some("".to_string()),
                 ..create_test_env(None, false, None, None)
             };
+            // 空文字の場合はそのまま返す（バリデーションは別途実施）
             assert_eq!(env.get_region(), "");
         }
     }
