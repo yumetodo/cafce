@@ -10,6 +10,16 @@ pub enum EndpointError {
     PortSetFailed,
 }
 
+#[derive(Debug, thiserror::Error)]
+pub enum EnvError {
+    #[error("環境変数の読み込みに失敗しました: {0}")]
+    Envy(#[from] envy::Error),
+    #[error(
+        "CAFCE_AWS_BUCKET が設定されていません。キャッシュを置く S3 バケット名を指定してください"
+    )]
+    MissingBucket,
+}
+
 fn default_insecure() -> bool {
     false
 }
@@ -19,7 +29,6 @@ fn default_force_path_style() -> Option<bool> {
 }
 
 #[derive(Deserialize, Debug)]
-#[allow(dead_code)]
 pub struct Env {
     /// S3互換サーバーのアドレス
     /// 例: "s3.amazonaws.com", "localhost:9000", "10.200.1.157:9000"
@@ -65,11 +74,46 @@ pub struct Env {
     /// Some(false): Virtual-hosted style強制
     #[serde(default = "default_force_path_style")]
     aws_force_path_style: Option<bool>,
+
+    /// キャッシュを置くS3バケット名（必須）
+    aws_bucket: Option<String>,
+
+    /// S3オブジェクトキーの先頭に付ける任意のprefix（末尾スラッシュは正規化）
+    s3_prefix: Option<String>,
+}
+
+fn normalize_s3_prefix(prefix: Option<String>) -> Option<String> {
+    prefix.and_then(|p| {
+        let trimmed = p.trim_end_matches('/').to_string();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed)
+        }
+    })
 }
 
 impl Env {
-    pub fn new() -> Result<Self, envy::Error> {
-        envy::prefixed("CAFCE_").from_env::<Env>()
+    pub fn new() -> Result<Self, EnvError> {
+        let mut env = envy::prefixed("CAFCE_").from_env::<Env>()?;
+
+        if env.aws_bucket.as_deref().is_none_or(str::is_empty) {
+            return Err(EnvError::MissingBucket);
+        }
+
+        env.s3_prefix = normalize_s3_prefix(env.s3_prefix);
+
+        Ok(env)
+    }
+
+    pub fn bucket(&self) -> &str {
+        self.aws_bucket
+            .as_deref()
+            .expect("bucket is validated at construction")
+    }
+
+    pub fn s3_prefix(&self) -> Option<&str> {
+        self.s3_prefix.as_deref()
     }
 
     /// サーバーアドレスからエンドポイントURLを生成する
@@ -97,15 +141,17 @@ impl Env {
         let url = Url::parse(&url_str)?;
 
         // 正規ポートの場合はポートを省略したURLを返す
-        let is_default_port = match (url.scheme(), url.port()) {
-            ("http", Some(80)) => true,
-            ("https", Some(443)) => true,
-            _ => false,
-        };
+
+        let is_default_port = matches!(
+            (url.scheme(), url.port()),
+            ("http", Some(80)) | ("https", Some(443))
+        );
 
         if is_default_port {
             let mut normalized = url.clone();
-            normalized.set_port(None).map_err(|_| EndpointError::PortSetFailed)?;
+            normalized
+                .set_port(None)
+                .map_err(|_| EndpointError::PortSetFailed)?;
             Ok(Some(normalized))
         } else {
             Ok(Some(url))
@@ -138,17 +184,16 @@ impl Env {
             return force;
         }
         match self.get_host() {
-            Some(host) => {
-                let host_lower = host.to_ascii_lowercase();
-                !host_lower.contains("amazonaws.com")
-            }
+            Some(host) => !host.to_ascii_lowercase().contains("amazonaws.com"),
             None => false, // SDKデフォルト（AWS S3）はvirtual-hosted
         }
     }
 
     /// 使用するリージョンを取得する
     pub fn get_region(&self) -> String {
-        self.aws_region.clone().unwrap_or_else(|| "us-east-1".to_string())
+        self.aws_region
+            .clone()
+            .unwrap_or_else(|| "us-east-1".to_string())
     }
 
     /// AWSアクセスキーを取得する
@@ -194,6 +239,7 @@ impl Env {
     }
 
     #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new_for_test(
         server_address: Option<String>,
         access_key: Option<String>,
@@ -217,6 +263,33 @@ impl Env {
             aws_insecure: insecure,
             aws_region: region,
             aws_force_path_style: force_path_style,
+            aws_bucket: None,
+            s3_prefix: None,
+        }
+    }
+
+    #[doc(hidden)]
+    pub fn new_for_test_with_bucket(
+        server_address: Option<String>,
+        access_key: Option<String>,
+        secret_key: Option<String>,
+        insecure: bool,
+        bucket: String,
+        s3_prefix: Option<String>,
+    ) -> Self {
+        Self {
+            aws_server_address: server_address,
+            aws_access_key: access_key,
+            aws_secret_key: secret_key,
+            aws_session_token: None,
+            aws_role_arn: None,
+            aws_role_session_name: None,
+            aws_profile: None,
+            aws_insecure: insecure,
+            aws_region: None,
+            aws_force_path_style: None,
+            aws_bucket: Some(bucket),
+            s3_prefix,
         }
     }
 }
@@ -242,6 +315,108 @@ mod tests {
             aws_insecure: insecure,
             aws_region: region.map(String::from),
             aws_force_path_style: force_path_style,
+            aws_bucket: None,
+            s3_prefix: None,
+        }
+    }
+
+    mod bucket_prefix_tests {
+        use super::*;
+
+        #[test]
+        fn test_bucket_accessor() {
+            // Arrange
+            let env = Env {
+                aws_bucket: Some("my-bucket".to_string()),
+                s3_prefix: None,
+                ..create_test_env(None, false, None, None)
+            };
+
+            // Act
+            let bucket = env.bucket();
+
+            // Assert
+            assert_eq!(bucket, "my-bucket");
+        }
+
+        #[test]
+        fn test_s3_prefix_some() {
+            // Arrange
+            let env = Env {
+                aws_bucket: Some("my-bucket".to_string()),
+                s3_prefix: Some("my-prefix".to_string()),
+                ..create_test_env(None, false, None, None)
+            };
+
+            // Act
+            let prefix = env.s3_prefix();
+
+            // Assert
+            assert_eq!(prefix, Some("my-prefix"));
+        }
+
+        #[test]
+        fn test_s3_prefix_none() {
+            // Arrange
+            let env = Env {
+                aws_bucket: Some("my-bucket".to_string()),
+                s3_prefix: None,
+                ..create_test_env(None, false, None, None)
+            };
+
+            // Act
+            let prefix = env.s3_prefix();
+
+            // Assert
+            assert_eq!(prefix, None);
+        }
+
+        #[test]
+        fn test_prefix_trailing_slash_normalized() {
+            // Arrange
+            let input = Some("my-prefix/".to_string());
+
+            // Act
+            let result = normalize_s3_prefix(input);
+
+            // Assert
+            assert_eq!(result.as_deref(), Some("my-prefix"));
+        }
+
+        #[test]
+        fn test_prefix_multiple_trailing_slashes_normalized() {
+            // Arrange
+            let input = Some("my-prefix///".to_string());
+
+            // Act
+            let result = normalize_s3_prefix(input);
+
+            // Assert
+            assert_eq!(result.as_deref(), Some("my-prefix"));
+        }
+
+        #[test]
+        fn test_prefix_only_slashes_becomes_none() {
+            // Arrange
+            let input = Some("/".to_string());
+
+            // Act
+            let result = normalize_s3_prefix(input);
+
+            // Assert
+            assert_eq!(result, None);
+        }
+
+        #[test]
+        fn test_prefix_empty_string_becomes_none() {
+            // Arrange: envy は空文字の env var を Some("") として渡す
+            let input = Some("".to_string());
+
+            // Act
+            let result = normalize_s3_prefix(input);
+
+            // Assert
+            assert_eq!(result, None);
         }
     }
 
@@ -410,16 +585,8 @@ mod tests {
         #[test]
         fn test_get_region_empty() {
             let env = Env {
-                aws_server_address: None,
-                aws_access_key: None,
-                aws_secret_key: None,
-                aws_session_token: None,
-                aws_role_arn: None,
-                aws_role_session_name: None,
-                aws_profile: None,
-                aws_insecure: false,
                 aws_region: Some("".to_string()),
-                aws_force_path_style: None,
+                ..create_test_env(None, false, None, None)
             };
             // 空文字の場合はそのまま返す（バリデーションは別途実施）
             assert_eq!(env.get_region(), "");

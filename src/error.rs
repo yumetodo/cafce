@@ -5,7 +5,4 @@ pub enum CacheKeyError {
 
     #[error("絶対パスのパターンは指定できません: {pattern}")]
     AbsolutePathNotAllowed { pattern: String },
-
-    #[error("指定されたパターンにマッチするファイルがありません")]
-    NoFilesMatched,
 }
