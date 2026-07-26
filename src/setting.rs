@@ -1,5 +1,3 @@
-use serde::{Deserialize, Serialize};
-
 #[derive(Debug, thiserror::Error)]
 pub enum SettingError {
     #[error("設定ファイルを開けませんでした: {0}")]
@@ -14,14 +12,14 @@ pub enum SettingError {
     UnterminatedVariableRef,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Key {
     pub files: Vec<String>,
     pub prefix: Option<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Setting {
     pub project: String,
@@ -41,9 +39,10 @@ fn expand_env_vars(s: &str) -> Result<String, SettingError> {
         match after_brace.find('}') {
             Some(close_pos) => {
                 let var_name = &after_brace[..close_pos];
-                let value = std::env::var(var_name).map_err(|_| SettingError::UndefinedVariable {
-                    name: var_name.to_string(),
-                })?;
+                let value =
+                    std::env::var(var_name).map_err(|_| SettingError::UndefinedVariable {
+                        name: var_name.to_string(),
+                    })?;
                 result.push_str(&value);
                 remaining = &after_brace[close_pos + 1..];
             }
@@ -105,8 +104,7 @@ impl Setting {
             fallback_keys: Vec::default(),
         };
         let mut file = std::fs::File::create(path)?;
-        let toml =
-            toml::to_string(&setting).expect("init setting serialization should never fail");
+        let toml = toml::to_string(&setting).expect("init setting serialization should never fail");
         write!(file, "{toml}")?;
         file.flush()?;
         Ok(())
@@ -177,7 +175,10 @@ mod tests {
             let result = expand_env_vars(input);
 
             // Assert
-            assert!(matches!(result, Err(SettingError::UndefinedVariable { .. })));
+            assert!(matches!(
+                result,
+                Err(SettingError::UndefinedVariable { .. })
+            ));
         }
 
         #[test]
@@ -337,10 +338,7 @@ fallback_keys = ["cache-main", "cache-default"]
 
             // Assert
             let setting = result.unwrap();
-            assert_eq!(
-                setting.fallback_keys,
-                vec!["cache-main", "cache-default"]
-            );
+            assert_eq!(setting.fallback_keys, vec!["cache-main", "cache-default"]);
         }
 
         #[test]
@@ -437,10 +435,7 @@ fallback_keys = ["cache-${CAFCE_TEST_DEFAULT_BRANCH}", "cache-default"]
 
             // Assert
             let setting = result.unwrap();
-            assert_eq!(
-                setting.fallback_keys,
-                vec!["cache-main", "cache-default"]
-            );
+            assert_eq!(setting.fallback_keys, vec!["cache-main", "cache-default"]);
         }
 
         #[test]
@@ -571,7 +566,10 @@ key = "cache-${CAFCE_UNDEFINED_VAR_FOR_TEST_XYZ}"
             let result = Setting::new_from_str(toml);
 
             // Assert
-            assert!(matches!(result, Err(SettingError::UndefinedVariable { .. })));
+            assert!(matches!(
+                result,
+                Err(SettingError::UndefinedVariable { .. })
+            ));
         }
     }
 

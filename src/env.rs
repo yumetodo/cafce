@@ -1,6 +1,3 @@
-use serde::Deserialize;
-use url::Url;
-
 /// エンドポイントURL生成時のエラー
 #[derive(Debug, thiserror::Error)]
 pub enum EndpointError {
@@ -28,7 +25,7 @@ fn default_force_path_style() -> Option<bool> {
     None
 }
 
-#[derive(Deserialize, Debug)]
+#[derive(serde::Deserialize, Debug)]
 pub struct Env {
     /// S3互換サーバーのアドレス
     /// 例: "s3.amazonaws.com", "localhost:9000", "10.200.1.157:9000"
@@ -122,7 +119,7 @@ impl Env {
     /// - 正規ポート（http:80, https:443）は省略
     /// - aws_server_addressが未指定またはs3.amazonaws.comの場合はNone（SDK既定）
     /// - IPv6アドレス（例: "[::1]:9000"）にも対応
-    pub fn build_endpoint(&self) -> Result<Option<Url>, EndpointError> {
+    pub fn build_endpoint(&self) -> Result<Option<url::Url>, EndpointError> {
         let addr = match self.aws_server_address.as_ref() {
             Some(a) if !a.is_empty() => a,
             _ => return Ok(None),
@@ -138,7 +135,7 @@ impl Env {
         // server_addressが "localhost:9000" や "[::1]:9000" のような形式の場合
         // 仮のURLとして組み立ててパース（url crateがIPv6も正しく処理）
         let url_str = format!("{scheme}://{addr}");
-        let url = Url::parse(&url_str)?;
+        let url = url::Url::parse(&url_str)?;
 
         // 正規ポートの場合はポートを省略したURLを返す
 
@@ -169,7 +166,10 @@ impl Env {
 
         // 仮のURLとしてパースしてホストを取得
         let url_str = format!("http://{addr}");
-        Url::parse(&url_str).ok()?.host_str().map(|s| s.to_string())
+        url::Url::parse(&url_str)
+            .ok()?
+            .host_str()
+            .map(|s| s.to_string())
     }
 
     /// Path-styleを使用すべきか判定する

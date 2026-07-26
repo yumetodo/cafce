@@ -1,7 +1,4 @@
 // src/s3_client.rs
-use crate::env::Env;
-use aws_sdk_s3::config::{Builder, Credentials, Region};
-use std::time::SystemTime;
 
 /// S3クライアント構築時のエラー
 #[derive(Debug, thiserror::Error)]
@@ -29,9 +26,9 @@ pub enum BuildClientError {
 /// * `Ok(Builder)` - 設定適用後のビルダー
 /// * `Err` - エンドポイントURL生成に失敗した場合
 pub fn apply_s3_config(
-    mut builder: Builder,
-    env: &Env,
-) -> Result<Builder, crate::env::EndpointError> {
+    mut builder: aws_sdk_s3::config::Builder,
+    env: &crate::env::Env,
+) -> Result<aws_sdk_s3::config::Builder, crate::env::EndpointError> {
     // エンドポイント設定（MinIO等の場合）
     if let Some(endpoint) = env.build_endpoint()? {
         builder = builder.endpoint_url(endpoint.to_string());
@@ -60,17 +57,17 @@ async fn assume_role(
     role_arn: &str,
     session_name: Option<&str>,
     region: &str,
-) -> Result<Credentials, BuildClientError> {
+) -> Result<aws_sdk_s3::config::Credentials, BuildClientError> {
     // STSクライアントを静的クレデンシャルで作成
     let sts_config = aws_config::defaults(aws_config::BehaviorVersion::latest())
-        .credentials_provider(Credentials::new(
+        .credentials_provider(aws_sdk_s3::config::Credentials::new(
             access_key,
             secret_key,
             None,
             None,
             "cafce-source",
         ))
-        .region(Region::new(region.to_string()))
+        .region(aws_sdk_s3::config::Region::new(region.to_string()))
         .load()
         .await;
 
@@ -89,9 +86,9 @@ async fn assume_role(
         .credentials
         .ok_or(BuildClientError::AssumeRoleMissingCredentials)?;
 
-    let expiration = SystemTime::try_from(creds.expiration).ok();
+    let expiration = std::time::SystemTime::try_from(creds.expiration).ok();
 
-    Ok(Credentials::new(
+    Ok(aws_sdk_s3::config::Credentials::new(
         creds.access_key_id,
         creds.secret_access_key,
         Some(creds.session_token),
@@ -113,9 +110,11 @@ async fn assume_role(
 ///      プロファイル名を設定し、SDKにクレデンシャル解決を委ねる
 ///      （未指定の場合はSDKデフォルトのcredential provider chainに委ねる）
 /// - エンドポイント・Path-style設定はapply_s3_config()に委譲する
-pub async fn build_s3_client(env: &Env) -> Result<aws_sdk_s3::Client, BuildClientError> {
+pub async fn build_s3_client(
+    env: &crate::env::Env,
+) -> Result<aws_sdk_s3::Client, BuildClientError> {
     let mut config_loader = aws_config::defaults(aws_config::BehaviorVersion::latest())
-        .region(Region::new(env.get_region()));
+        .region(aws_sdk_s3::config::Region::new(env.get_region()));
 
     // AssumeRole・静的クレデンシャルのいずれでもない場合のみ、プロファイル名を設定する
     // （プロファイルが指すクレデンシャル解決はSDKに任せる）
@@ -128,7 +127,7 @@ pub async fn build_s3_client(env: &Env) -> Result<aws_sdk_s3::Client, BuildClien
 
     let shared_config = config_loader.load().await;
 
-    let mut builder = Builder::from(&shared_config);
+    let mut builder = aws_sdk_s3::config::Builder::from(&shared_config);
 
     if let Some(role_arn) = env.role_arn() {
         // AssumeRole: access_key/secret_keyをソースクレデンシャルとして使用
@@ -149,7 +148,7 @@ pub async fn build_s3_client(env: &Env) -> Result<aws_sdk_s3::Client, BuildClien
         builder = builder.credentials_provider(assumed_credentials);
     } else if let (Some(access_key), Some(secret_key)) = (env.access_key(), env.secret_key()) {
         // 静的クレデンシャル（MinIO向け / AWS直接接続）
-        let credentials = Credentials::new(
+        let credentials = aws_sdk_s3::config::Credentials::new(
             access_key,
             secret_key,
             env.session_token().map(String::from),
@@ -362,7 +361,11 @@ mod rustfs_integration_tests {
             .await
             .expect("failed to collect get_object body")
             .into_bytes();
-        assert_eq!(body.as_ref(), content, "downloaded content does not match uploaded content");
+        assert_eq!(
+            body.as_ref(),
+            content,
+            "downloaded content does not match uploaded content"
+        );
 
         // 5. delete_object
         client

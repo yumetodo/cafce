@@ -1,14 +1,12 @@
-use bpaf::Bpaf;
-
 /// Cache management tool for CI pipelines
-#[derive(Debug, Clone, Bpaf)]
+#[derive(Debug, Clone, bpaf::Bpaf)]
 #[bpaf(options, version)]
 struct Opts {
     #[bpaf(external)]
     action: Action,
 }
 
-#[derive(Debug, Clone, Bpaf)]
+#[derive(Debug, Clone, bpaf::Bpaf)]
 enum Action {
     /// Store files to the cache (not yet implemented)
     #[bpaf(command)]
@@ -68,9 +66,11 @@ async fn run(opts: Opts) -> anyhow::Result<()> {
 
     match opts.action {
         Action::Key { config } => {
-            let cwd = std::env::current_dir().context("カレントディレクトリの取得に失敗しました")?;
-            let setting = cafce::setting::Setting::new_from_file(&config)
-                .with_context(|| format!("設定ファイルの読み込みに失敗しました: {}", config.display()))?;
+            let cwd =
+                std::env::current_dir().context("カレントディレクトリの取得に失敗しました")?;
+            let setting = cafce::setting::Setting::new_from_file(&config).with_context(|| {
+                format!("設定ファイルの読み込みに失敗しました: {}", config.display())
+            })?;
             let key = setting
                 .resolve_primary_key(&cwd)
                 .context("primary キーの計算に失敗しました")?;
@@ -78,9 +78,11 @@ async fn run(opts: Opts) -> anyhow::Result<()> {
         }
 
         Action::Probe { config } => {
-            let cwd = std::env::current_dir().context("カレントディレクトリの取得に失敗しました")?;
-            let setting = cafce::setting::Setting::new_from_file(&config)
-                .with_context(|| format!("設定ファイルの読み込みに失敗しました: {}", config.display()))?;
+            let cwd =
+                std::env::current_dir().context("カレントディレクトリの取得に失敗しました")?;
+            let setting = cafce::setting::Setting::new_from_file(&config).with_context(|| {
+                format!("設定ファイルの読み込みに失敗しました: {}", config.display())
+            })?;
             let env = cafce::env::Env::new().context("環境変数の読み込みに失敗しました")?;
             let client = cafce::s3_client::build_s3_client(&env)
                 .await
@@ -90,14 +92,16 @@ async fn run(opts: Opts) -> anyhow::Result<()> {
         }
 
         Action::Init { config } => {
-            cafce::setting::Setting::init_to_file(&config)
-                .with_context(|| format!("設定ファイルの初期化に失敗しました: {}", config.display()))?;
+            cafce::setting::Setting::init_to_file(&config).with_context(|| {
+                format!("設定ファイルの初期化に失敗しました: {}", config.display())
+            })?;
         }
 
         Action::Store { config } => {
             let env = cafce::env::Env::new().context("環境変数の読み込みに失敗しました")?;
-            let setting = cafce::setting::Setting::new_from_file(&config)
-                .with_context(|| format!("設定ファイルの読み込みに失敗しました: {}", config.display()))?;
+            let setting = cafce::setting::Setting::new_from_file(&config).with_context(|| {
+                format!("設定ファイルの読み込みに失敗しました: {}", config.display())
+            })?;
             println!("{config:#?}");
             println!("{env:#?}");
             println!("{setting:#?}");
@@ -105,8 +109,9 @@ async fn run(opts: Opts) -> anyhow::Result<()> {
 
         Action::Restore { config } => {
             let env = cafce::env::Env::new().context("環境変数の読み込みに失敗しました")?;
-            let setting = cafce::setting::Setting::new_from_file(&config)
-                .with_context(|| format!("設定ファイルの読み込みに失敗しました: {}", config.display()))?;
+            let setting = cafce::setting::Setting::new_from_file(&config).with_context(|| {
+                format!("設定ファイルの読み込みに失敗しました: {}", config.display())
+            })?;
             println!("{config:#?}");
             println!("{env:#?}");
             println!("{setting:#?}");
