@@ -26,14 +26,15 @@ impl CacheKeyGenerator {
         }
 
         // HashCalculatorを使ってファイルのハッシュを計算
-        let files_hash = crate::hash_calculator::HashCalculator::calculate_files_hash(&matched_files)?;
-        
+        let files_hash =
+            crate::hash_calculator::HashCalculator::calculate_files_hash(&matched_files)?;
+
         // プレフィックスがある場合は結合
         let final_key = match &key_config.prefix {
             Some(prefix) => format!("{prefix}-{files_hash}"),
             None => files_hash,
         };
-        
+
         Ok(final_key)
     }
 }
@@ -52,10 +53,10 @@ mod tests {
     fn test_generate_key_with_files() {
         let temp_dir = tempfile::tempdir().unwrap();
         let base_path = temp_dir.path().to_path_buf();
-        
+
         // テスト用ファイルを作成
         std::fs::write(temp_dir.path().join("test.txt"), "test content").unwrap();
-        
+
         let generator = super::CacheKeyGenerator::new(50, base_path);
         let key_config = crate::setting::Key {
             files: vec!["test.txt".to_string()],
@@ -73,10 +74,10 @@ mod tests {
     fn test_generate_key_with_prefix() {
         let temp_dir = tempfile::tempdir().unwrap();
         let base_path = temp_dir.path().to_path_buf();
-        
+
         // テスト用ファイルを作成
         std::fs::write(temp_dir.path().join("test.txt"), "test content").unwrap();
-        
+
         let generator = super::CacheKeyGenerator::new(50, base_path);
         let key_config = crate::setting::Key {
             files: vec!["test.txt".to_string()],
@@ -94,11 +95,11 @@ mod tests {
     fn test_generate_key_with_wildcard() {
         let temp_dir = tempfile::tempdir().unwrap();
         let base_path = temp_dir.path().to_path_buf();
-        
+
         // テスト用ファイルを作成
         std::fs::write(temp_dir.path().join("test1.txt"), "content1").unwrap();
         std::fs::write(temp_dir.path().join("test2.txt"), "content2").unwrap();
-        
+
         let generator = super::CacheKeyGenerator::new(50, base_path);
         let key_config = crate::setting::Key {
             files: vec!["*.txt".to_string()],
@@ -116,11 +117,11 @@ mod tests {
     fn test_generate_key_with_multiple_patterns() {
         let temp_dir = tempfile::tempdir().unwrap();
         let base_path = temp_dir.path().to_path_buf();
-        
+
         // テスト用ファイルを作成
         std::fs::write(temp_dir.path().join("package.json"), "{}").unwrap();
         std::fs::write(temp_dir.path().join("yarn.lock"), "lock content").unwrap();
-        
+
         let generator = super::CacheKeyGenerator::new(50, base_path);
         let key_config = crate::setting::Key {
             files: vec!["package.json".to_string(), "*.lock".to_string()],
@@ -176,10 +177,10 @@ mod tests {
     fn test_generate_key_same_files_same_hash() {
         let temp_dir = tempfile::tempdir().unwrap();
         let base_path = temp_dir.path().to_path_buf();
-        
+
         // テスト用ファイルを作成
         std::fs::write(temp_dir.path().join("test.txt"), "test content").unwrap();
-        
+
         let generator = super::CacheKeyGenerator::new(50, base_path);
         let key_config = crate::setting::Key {
             files: vec!["test.txt".to_string()],
@@ -188,7 +189,7 @@ mod tests {
 
         let result1 = generator.generate_key(&key_config);
         let result2 = generator.generate_key(&key_config);
-        
+
         assert!(result1.is_ok());
         assert!(result2.is_ok());
         assert_eq!(result1.unwrap(), result2.unwrap());
@@ -198,10 +199,10 @@ mod tests {
     fn test_generate_key_different_content_different_hash() {
         let temp_dir = tempfile::tempdir().unwrap();
         let base_path = temp_dir.path().to_path_buf();
-        
+
         // 最初のファイル内容
         std::fs::write(temp_dir.path().join("test.txt"), "content1").unwrap();
-        
+
         let generator = super::CacheKeyGenerator::new(50, base_path);
         let key_config = crate::setting::Key {
             files: vec!["test.txt".to_string()],
@@ -209,12 +210,12 @@ mod tests {
         };
 
         let result1 = generator.generate_key(&key_config);
-        
+
         // ファイル内容を変更
         std::fs::write(temp_dir.path().join("test.txt"), "content2").unwrap();
-        
+
         let result2 = generator.generate_key(&key_config);
-        
+
         assert!(result1.is_ok());
         assert!(result2.is_ok());
         assert_ne!(result1.unwrap(), result2.unwrap());
