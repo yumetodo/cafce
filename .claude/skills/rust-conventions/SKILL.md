@@ -23,7 +23,8 @@ description: This skill should be used whenever writing, editing, or reviewing R
 - ファイル先頭・モジュール先頭での `use` は基本使わない。`std::rc::Rc<std::cell::RefCell<T>>` のようにフルパスで書く。
   - 例外: `use std::rc::Rc;` / `use std::sync::Arc;` のような衝突しにくいものは許容する。
   - 例外: 関数内スコープの先頭での `use` はスコープが狭くコピペ可植性が高いため許容する。
-- `use hoge::prelude::*;` のようなワイルドカードimportは使わない。
+  - 例外: `#[cfg(test)] mod tests { ... }` 内は対象外とする。`use super::*;` や `use crate::hoge::Huga;` をモジュール先頭で使ってよい。テストモジュールはRustの標準的な書き方であるコピペ移植性より可読性を優先し、スコープもそのテストモジュール内に閉じるため。
+- `use hoge::prelude::*;` のようなワイルドカードimportは使わない（上記のテストモジュール例外を除く）。
 - crate名は `hoge_huga`（アンダースコア区切り）で統一し、`hoge-huga` とは書かない。
 
 ## 設計・抽象化
