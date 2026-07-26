@@ -26,8 +26,8 @@ So, there is a simple solution that calculates the cache key on each CI job afte
 | `cafce key <CONFIG>` | Compute the primary cache key from `<CONFIG>` and print it to stdout on a single line. Exit code 0 on success. |
 | `cafce probe <CONFIG>` | Check whether the primary key (or any of `fallback_keys`) exists in S3. Prints `true` or `false` to stdout. Exit code 0 for both hit and miss; non-zero on S3 / auth / config errors written to stderr. |
 | `cafce init <CONFIG>` | Write a starter TOML configuration file to `<CONFIG>`. |
-| `cafce store <CONFIG>` | Not yet implemented — reserved for [#7](https://github.com/yumtodo/cafce/issues/7). |
-| `cafce restore <CONFIG>` | Not yet implemented — reserved for [#7](https://github.com/yumtodo/cafce/issues/7). |
+| `cafce store <CONFIG>` | Not yet implemented — reserved for [#7](https://github.com/yumetodo/cafce/issues/7). |
+| `cafce restore <CONFIG>` | Not yet implemented — reserved for [#7](https://github.com/yumetodo/cafce/issues/7). |
 
 `cafce key` is intended to be composed with shell, for example:
 
@@ -56,7 +56,7 @@ A cafce configuration file is a TOML document with the following fields:
 | `key.files` | array of strings | — | Glob patterns whose contents are hashed to form the key. Patterns are resolved from the current working directory; absolute paths are rejected. |
 | `key.prefix` | string | — | Prepended to the computed hash (e.g. `"deps-v1"` becomes `deps-v1-<hash>`). `${VAR}` env expansion is applied. |
 | `fallback_keys` | array of strings | — | Alternative cache keys tried in order by `cafce probe` when the primary key misses. Empty by default. `${VAR}` env expansion is applied to each element. |
-| `paths` | array of strings | — | Reserved for [#7](https://github.com/yumtodo/cafce/issues/7) (`store` / `restore`). Currently parsed but unused. |
+| `paths` | array of strings | — | Reserved for [#7](https://github.com/yumetodo/cafce/issues/7) (`store` / `restore`). Currently parsed but unused. |
 
 Unknown fields are rejected at parse time (`#[serde(deny_unknown_fields)]`) so that typos surface immediately rather than silently taking effect.
 
@@ -142,10 +142,10 @@ Grant the following actions on the bucket configured via `CAFCE_AWS_BUCKET`:
 
 | Action | Why |
 |---|---|
-| `s3:GetObject` | Required to check individual cache objects (used by `probe`, and by `restore` once [#7](https://github.com/yumtodo/cafce/issues/7) lands). |
+| `s3:GetObject` | Required to check individual cache objects (used by `probe`, and by `restore` once [#7](https://github.com/yumetodo/cafce/issues/7) lands). |
 | `s3:ListBucket` | Required so that AWS S3 returns `404 NotFound` (not `403 AccessDenied`) for missing keys. cafce treats 403 as an error — not a cache miss — because a silent auth failure disguised as a permanent cache miss would cause every CI run to fall back to a full build without any visible warning. |
 
-Once [#7](https://github.com/yumtodo/cafce/issues/7) adds `store` / `restore`, `s3:PutObject` and `s3:DeleteObject` will also be needed.
+Once [#7](https://github.com/yumetodo/cafce/issues/7) adds `store` / `restore`, `s3:PutObject` and `s3:DeleteObject` will also be needed.
 
 ## Local development (RustFS)
 
@@ -191,4 +191,4 @@ cafce key   cafce.toml   # prints: hello
 cafce probe cafce.toml   # prints: false  (nothing has been stored yet)
 ```
 
-`probe` will start returning `true` once `store` (planned for [#7](https://github.com/yumtodo/cafce/issues/7)) or an equivalent `aws s3 cp` uploads an object at `cafce-dev/cafce-dev/hello`.
+`probe` will start returning `true` once `store` (planned for [#7](https://github.com/yumetodo/cafce/issues/7)) or an equivalent `aws s3 cp` uploads an object at `cafce-dev/cafce-dev/hello`.
