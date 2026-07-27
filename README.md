@@ -19,6 +19,10 @@ According to this GitLab CI/CD maintainer's post, calculating the cache key from
 
 So, there is a simple solution that calculates the cache key on each CI job after executing git checkout.
 
+## MSRV
+
+The minimum supported Rust version is `1.94.1`, driven by the `aws-sdk-*` dependency tree (a lower bound — newer `rustc` is fine). `rust-toolchain.toml` pins the toolchain to exactly `1.94.1`, so there is currently zero margin on the low side: any setup that resolves to an older `rustc` will fail to compile. `rust-toolchain.toml` only pins the toolchain for builds run from within this directory tree — building with `--manifest-path` from outside it (or any other setup that skips toolchain auto-detection) falls back to whatever `rustc` is otherwise on `PATH`, which can be older and fail to compile.
+
 ## Commands
 
 | Command | Description |

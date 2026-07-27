@@ -9,9 +9,6 @@
 /// ```
 #[cfg(test)]
 mod probe_integration_tests {
-    use aws_sdk_s3::primitives::ByteStream;
-    use std::time::{SystemTime, UNIX_EPOCH};
-
     fn rustfs_env(bucket: &str) -> cafce::env::Env {
         cafce::env::Env::new_for_test_with_bucket(
             Some("localhost:9000".to_string()),
@@ -24,6 +21,8 @@ mod probe_integration_tests {
     }
 
     fn unique_name(prefix: &str) -> String {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("system clock is before UNIX_EPOCH")
@@ -31,7 +30,11 @@ mod probe_integration_tests {
         format!("{prefix}-{nanos}")
     }
 
-    fn make_setting(project: &str, primary_key: &str, fallback_keys: Vec<String>) -> cafce::setting::Setting {
+    fn make_setting(
+        project: &str,
+        primary_key: &str,
+        fallback_keys: Vec<String>,
+    ) -> cafce::setting::Setting {
         cafce::setting::Setting {
             project: project.to_string(),
             paths: vec![],
@@ -62,11 +65,8 @@ mod probe_integration_tests {
     }
 
     /// バケット作成→テスト実行→全オブジェクト削除→バケット削除のラッパー
-    async fn with_bucket<F, Fut>(
-        client: &aws_sdk_s3::Client,
-        bucket: &str,
-        f: F,
-    ) where
+    async fn with_bucket<F, Fut>(client: &aws_sdk_s3::Client, bucket: &str, f: F)
+    where
         F: FnOnce() -> Fut,
         Fut: std::future::Future<Output = ()>,
     {
@@ -95,7 +95,9 @@ mod probe_integration_tests {
             .put_object()
             .bucket(bucket)
             .key(key)
-            .body(ByteStream::from_static(b"cafce-probe-test"))
+            .body(aws_sdk_s3::primitives::ByteStream::from_static(
+                b"cafce-probe-test",
+            ))
             .send()
             .await
             .unwrap_or_else(|e| panic!("put_object({bucket}/{key}) failed: {e:?}"));
@@ -118,13 +120,8 @@ mod probe_integration_tests {
             put_object(&client, &bucket, &object_key).await;
 
             // Act
-            let result = cafce::probe::probe(
-                &setting,
-                &env,
-                &client,
-                std::path::Path::new("."),
-            )
-            .await;
+            let result =
+                cafce::probe::probe(&setting, &env, &client, std::path::Path::new(".")).await;
 
             // Assert
             assert!(result.unwrap(), "primary key が存在するので true のはず");
@@ -151,19 +148,11 @@ mod probe_integration_tests {
             put_object(&client, &bucket, &fallback_object_key).await;
 
             // Act
-            let result = cafce::probe::probe(
-                &setting,
-                &env,
-                &client,
-                std::path::Path::new("."),
-            )
-            .await;
+            let result =
+                cafce::probe::probe(&setting, &env, &client, std::path::Path::new(".")).await;
 
             // Assert
-            assert!(
-                result.unwrap(),
-                "fallback key が存在するので true のはず"
-            );
+            assert!(result.unwrap(), "fallback key が存在するので true のはず");
         })
         .await;
     }
@@ -186,13 +175,8 @@ mod probe_integration_tests {
 
         with_bucket(&client, &bucket, || async {
             // Act: 何も置かない
-            let result = cafce::probe::probe(
-                &setting,
-                &env,
-                &client,
-                std::path::Path::new("."),
-            )
-            .await;
+            let result =
+                cafce::probe::probe(&setting, &env, &client, std::path::Path::new(".")).await;
 
             // Assert
             assert!(!result.unwrap(), "何も存在しないので false のはず");
