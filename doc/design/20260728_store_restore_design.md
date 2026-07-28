@@ -47,8 +47,8 @@
 | ファイル | 役割 |
 |---|---|
 | `src/path_matcher.rs` | `Setting.paths` の glob パターンを、アーカイブ対象のエントリ列（ファイル・ディレクトリ・シンボリックリンク）へ解決する。ディレクトリは再帰的に展開する |
-| `src/archive.rs` | 決定論的な tar + zstd アーカイブの生成と展開。生成時は tar ストリームの SHA-256 を同時に計算する。ローカル I/O のみで S3 を知らない |
-| `src/cache_metadata.rs` | S3 user metadata のキー名定数と、生成・検証（パース）のロジック |
+| `src/archive.rs` | 決定論的な tar + zstd アーカイブの生成と展開。生成時は tar ストリームの SHA-256（内容ハッシュ）と圧縮後バイト列の SHA-256（S3 チェックサム用）を同時に計算する。ローカル I/O のみで S3 を知らない |
+| `src/cache_metadata.rs` | S3 user metadata のキー名定数と、生成・検証（パース）のロジック。S3 フレキシブルチェックサム用の Base64 変換もここに置く |
 | `src/store.rs` | `store` サブコマンドのロジック（対象解決 → アーカイブ生成 → 既存オブジェクトのハッシュ照合 → 必要時のみ `put_object`） |
 | `src/restore.rs` | `restore` サブコマンドのロジック（キー候補の順序試行 → `get_object` → 展開 → 内容ハッシュ検証） |
 | `tests/store_restore_integration.rs` | rustfs 宛の `store` / `restore` 統合テスト（`docker compose up -d` 前提、`#[ignore]` 指定） |
@@ -71,6 +71,9 @@
 - **S3 metadata のハッシュ仕様確定**: アーカイブ内容の SHA-256 を格納する user metadata のキー名・値形式・スキーマバージョンを定義する
   成功指標: `store` が付与したメタデータを `restore` が解釈でき、未知スキーマバージョンを検出したときに明示的なエラーになること
 
+- **S3 フレキシブルチェックサムの併用**: アップロード時に事前計算した `x-amz-checksum-sha256` を添えてサーバ側でも照合させ、ダウンロード時は SDK に検証させる
+  成功指標: 破損したボディに対する `PutObject` が `BadDigest` で拒否されること、`GetObject` 側の検証が有効になっていること（RustFS 統合テストで確認）
+
 - **`store` サブコマンドの実装**: 対象を圧縮し、primary key に対応するオブジェクトの metadata ハッシュと照合し、不一致またはオブジェクト不在のときだけアップロードする
   成功指標: rustfs 統合テストで、(a) 初回は `put_object` が走る、(b) 内容を変えずに再実行するとアップロードが省略される（`LastModified` が変わらない）、(c) 内容を変えると上書きされる、が確認できること
 
@@ -89,6 +92,7 @@
 - **並行実行時の排他制御**: 同一キーへの同時 `store` は last-write-wins とし、ロック機構は入れない
 - **暗号化の明示指定（SSE-KMS 等）**: バケット既定の暗号化設定に委ね、cafce からは指定しない
 - **ハードリンク・デバイスファイル・FIFO の保存**: ハードリンクは通常ファイルとして重複保存し、特殊ファイルはスキップする
+- **異なる OS 間でのアーカイブハッシュの一致**: 決定論性は「同一プラットフォーム上で同一内容なら同一バイト列」までを保証範囲とする。Windows と Unix では実行ビットの表現が異なるため、同じ内容でもハッシュが割れうる（6.4）。これは制約として受け入れ、cafce 側で吸収しない
 
 ## 6. Solution / Technical Architecture (解決策 / 技術アーキテクチャ)
 
@@ -104,14 +108,14 @@ flowchart TD
         S4 --> S6{metadata の<br/>content-sha256 と一致?}
         S5 --> S6
         S6 -->|一致| S7[アップロードしない<br/>stdout: false]
-        S6 -->|不一致 / オブジェクト無し| S8[put_object<br/>+ user metadata<br/>stdout: true]
+        S6 -->|不一致 / オブジェクト無し| S8[put_object<br/>+ user metadata<br/>+ x-amz-checksum-sha256<br/>S3 側でも再計算・照合<br/>stdout: true]
     end
 
     subgraph restore["cafce restore <config>"]
         R1[config 読み込み<br/>Setting] --> R2[キー候補列<br/>primary → fallback_keys]
         R2 --> R3[get_object を順に試行]
         R3 -->|全 miss| R4[stdout: false]
-        R3 -->|hit| R5[zstd 展開 + tar 展開<br/>SHA-256 を同時計算]
+        R3 -->|hit| R5[ボディ受信<br/>SDK が x-amz-checksum-sha256 を検証<br/>→ zstd 展開 + tar 展開<br/>SHA-256 を同時計算]
         R5 --> R6{metadata の<br/>content-sha256 と一致?}
         R6 -->|一致| R7[stdout: true]
         R6 -->|不一致| R8[エラー終了]
@@ -164,7 +168,7 @@ zstd フレーム自体はタイムスタンプを持たないため、非決定
 | tar フォーマット | GNU 形式（長いパスは GNU longname エントリ） | pax 拡張ヘッダに atime/ctime を載せない |
 | zstd | 圧縮レベル固定（既定 3）、シングルスレッド、フレームチェックサム有効 | レベル・スレッド数が変われば出力バイト列が変わるため固定する |
 
-生成時は「tar ストリーム → SHA-256 を計算しつつ zstd エンコーダへ流す」という一段のパイプラインにする。アーカイブは一時ファイル（`tempfile`）へ書き出し、そのまま `ByteStream::from_path` でアップロードする。メモリ上に全体を載せない。
+生成時は「tar ストリーム → SHA-256（内容ハッシュ）を計算しつつ zstd エンコーダへ流す → 出力される圧縮後バイト列にも SHA-256（転送チェックサム、6.7）を通しつつ一時ファイルへ書く」という一段のパイプラインにする。ハッシュ器は 2 本になるが、データを流すパスは 1 回きりでファイルの読み直しは発生しない。書き出した一時ファイル（`tempfile`）は、そのまま `ByteStream::from_path` でアップロードする。メモリ上に全体を載せない。
 
 展開時は逆順（`get_object` のストリーム → 一時ファイル → zstd デコード → SHA-256 計算しつつ tar 展開）で、以下の安全策を課す：
 
@@ -191,44 +195,81 @@ S3 の user metadata はキーが `x-amz-meta-` 接頭辞付きで送られ、�
 | `cafce-archive-format` | `tar+zstd` | ペイロードのアーカイブ形式 |
 | `cafce-content-sha256` | 小文字 16 進 64 文字 | **展開後の内容の同一性を表すハッシュ**。zstd 圧縮前の tar ストリーム全体に対する SHA-256 |
 
-`cafce-content-sha256` の対象を「オブジェクト本体（tar.zst のバイト列）」ではなく「圧縮前の tar ストリーム」にするのは、ハッシュを**内容の同一性**の表現にしたいためである。zstd のバージョンやレベルが変われば同じ内容でも本体バイト列は変わるが、tar ストリームは変わらない。CI 群の中に cafce のバージョンが混在していても、内容が同じ限り再アップロードは起きない。転送経路のビット化けは zstd のフレームチェックサムが検出する。
+`cafce-content-sha256` の対象を「オブジェクト本体（tar.zst のバイト列）」ではなく「圧縮前の tar ストリーム」にするのは、ハッシュを**内容の同一性**の表現にしたいためである。zstd のバージョンやレベルが変われば同じ内容でも本体バイト列は変わるが、tar ストリームは変わらない。CI 群の中に cafce のバージョンが混在していても、内容が同じ限り再アップロードは起きない。
+
+このハッシュは**転送・保管の破損検出には使わない**。破損検出は 6.7 で述べる S3 のフレキシブルチェックサム（`x-amz-checksum-sha256`）に担当させ、役割を分離する。
 
 読み取り側の互換性方針：
 
 - `cafce-schema-version` が未知（将来の版数）のオブジェクトを `restore` が引いた場合は、黙って展開せずエラーにする
 - メタデータが 1 つも無いオブジェクト（cafce 以外が置いたもの、あるいは `aws s3 cp` で手置きしたもの）は、`restore` では**内容ハッシュ検証をスキップして展開を試みる**。`store` では「ハッシュ不一致」と同じ扱いにして上書きする
 
-### 6.7 `store` サブコマンドの仕様
+### 6.7 S3 フレキシブルチェックサムの併用
+
+S3 には、アップロード時にクライアントが計算したチェックサムを添えると **S3 側でも同じアルゴリズムで再計算して照合し、一致しなければ `BadDigest` で拒否する**機能がある（フレキシブルチェックサム）。照合に通った値はオブジェクトと共に保管され、ダウンロード時に検証にも使える。cafce はこれを 6.6 の metadata ハッシュと**併用**する。2 つのハッシュは対象も目的も異なる。
+
+| | `x-amz-checksum-sha256` | `x-amz-meta-cafce-content-sha256` |
+|---|---|---|
+| 対象 | オブジェクト本体（tar.zst のバイト列） | 圧縮前の tar ストリーム |
+| 値の形式 | 32 バイトダイジェストの Base64 | 小文字 16 進 64 文字 |
+| 目的 | 転送・保管の破損検出 | 内容の同一性判定（再アップロードの抑止） |
+| 検証者 | アップロード時は S3 サーバ、ダウンロード時は AWS SDK | cafce 自身 |
+| 圧縮方式が変わったとき | 値が変わる（本体が変わるので当然） | 変わらない |
+
+**アップロード時（`store`）**
+
+`put_object` に `checksum_algorithm(ChecksumAlgorithm::Sha256)` と `checksum_sha256(<Base64>)` の両方を指定する。値はアーカイブ生成時に、tar ストリームのハッシュと並行して圧縮後バイト列に対しても SHA-256 を計算して得る（一時ファイルを書き出す過程で 2 本のハッシュ器に流すだけで、追加のファイル読み直しは発生しない）。
+
+**あらかじめ計算した値を渡す**ことが重要である。値を渡さず `checksum_algorithm` だけを指定すると、SDK はストリーミングボディに対して `aws-chunked` エンコーディングのトレーラとしてチェックサムを送る。この形式は S3 互換サーバでの対応がまちまちで、cafce が主要な動作環境として想定するローカル RustFS や他の S3 互換ストアで弾かれるリスクがある。事前計算値を渡せば通常のリクエストヘッダとして送られ、互換性の問題を避けられる。
+
+なお AWS SDK for Rust は既定（`RequestChecksumCalculation::WhenSupported`）で、何も指定しなくても CRC-32 のチェックサムを付けて送る。cafce が明示的に SHA-256 を指定するのは、(a) 既に SHA-256 の計算基盤があり実装が単純であること、(b) `head_object` / `get_object` から返る値が cafce 自身の計算値と直接比較できる形式であること、による。
+
+**ダウンロード時（`restore`）**
+
+`get_object` に `checksum_mode(ChecksumMode::Enabled)` を明示する（SDK の既定 `ResponseChecksumValidation::WhenSupported` でも同等の検証が働くが、意図を明示し、環境変数 `AWS_RESPONSE_CHECKSUM_VALIDATION` 等で無効化された環境でも検証が外れないようにする）。SDK はボディを消費しながらチェックサムを計算し、不一致ならボディ読み出しの途中でエラーになる。つまり **cafce は展開処理でボディを最後まで読み切る必要がある**（読み切らなければ検証は行われない）。
+
+オブジェクトがチェックサム無しで置かれていた場合、SDK 側の検証は単に行われない（エラーにはならない）。この場合でも 6.6 の内容ハッシュ検証は独立に働くため、検証がゼロになることはない。
+
+**`store` の重複判定には使わない**
+
+`head_object` にも `checksum_mode` を指定すれば `x-amz-checksum-sha256` が取得できるが、これは本体バイト列のハッシュであり圧縮方式に依存するため、再アップロード抑止の判定には使わない（6.6 および代替案1 の議論のとおり）。判定は常に metadata の `cafce-content-sha256` で行う。
+
+**単一 PUT に限る話であること**
+
+SHA-256 は単一 PUT（full object checksum）でのみ「オブジェクト全体のチェックサム」として使える。マルチパートアップロードでは SHA-256 は composite（パート単位チェックサムの合成）扱いになり、全体のハッシュとしては使えない。cafce は当面マルチパート非対応（Non-Goal）なのでこの制約に当たらないが、将来対応する際にはこの節の設計を見直す必要がある。
+
+### 6.8 `store` サブコマンドの仕様
 
 1. config を読み、カレントディレクトリを基準に primary key を計算する（`fallback_keys` は使わない。書き込み先は常に primary key である）
 2. `paths` を解決してアーカイブ対象エントリを得る（空ならエラー）
-3. 決定論的アーカイブを一時ファイルへ生成し、tar ストリームの SHA-256 を得る
+3. 決定論的アーカイブを一時ファイルへ生成し、**tar ストリームの SHA-256（内容ハッシュ）と圧縮後バイト列の SHA-256（転送チェックサム）を同時に得る**
 4. `{prefix?}/{project}/{primary_key}` に対して `head_object` する
    - 存在し、かつ `cafce-content-sha256` が一致 → アップロードせず終了（stdout に `false`）
    - 存在するがハッシュ不一致 / メタデータ欠落 → 5 へ
    - 404 → 5 へ
    - 403 その他 → エラー終了（`probe` と同じく、silent な auth failure を cache miss に見せかけない）
-5. `put_object` で 6.6 のメタデータ付きアップロード（stdout に `true`）
+5. `put_object` で 6.6 のメタデータと 6.7 のチェックサム（`checksum_algorithm` + 事前計算した `checksum_sha256`）を添えてアップロードする（stdout に `true`）。S3 側の再計算で不一致なら `BadDigest` が返るので、そのままエラー終了する
 
 `head_object` は `probe` と同じ 404/403 の扱いをするため、判定部分は `probe.rs` の既存関数を metadata も返す形へ拡張して共用する。
 
-### 6.8 `restore` サブコマンドの仕様
+### 6.9 `restore` サブコマンドの仕様
 
 1. config を読み、primary key と `fallback_keys` からキー候補列を作る（`probe` と同じ順序・同じ解決経路。`probe` が `true` を返す状況では `restore` も必ずヒットする、という不変条件を保つ）
-2. 各候補について `get_object` を発行する
+2. 各候補について `get_object` を `checksum_mode(ChecksumMode::Enabled)` 付きで発行する
    - `NoSuchKey` → 次の候補へ
    - 403 その他 → エラー終了
    - 成功 → 3 へ（以降の候補は試さない）
 3. レスポンスのメタデータからスキーマ版数を検証する
-4. ボディを一時ファイルへ落とし、zstd 展開しながら tar をカレントディレクトリへ展開し、同時に tar ストリームの SHA-256 を計算する
-5. `cafce-content-sha256` と照合し、不一致ならエラー終了（stdout には何も出さない）
-6. 成功なら stdout に `true`。全 miss なら stdout に `false`（exit 0）
+4. ボディを最後まで読み切って一時ファイルへ落とす（ここで SDK が `x-amz-checksum-sha256` を検証する。不一致ならボディ読み出しがエラーになるので、展開を始める前に破損を検出できる）
+5. zstd 展開しながら tar をカレントディレクトリへ展開し、同時に tar ストリームの SHA-256 を計算する
+6. `cafce-content-sha256` と照合し、不一致ならエラー終了（stdout には何も出さない）
+7. 成功なら stdout に `true`。全 miss なら stdout に `false`（exit 0）
 
 存在確認に `head_object` を挟まず `get_object` を直接使うのは、ヒット時のラウンドトリップを 1 回減らせるうえ、必要な IAM 権限が変わらないためである。
 
-ハッシュ不一致は展開後に判明するため、その時点でファイル木は既に書き換わっている。この場合は「作業ディレクトリに中途半端に復元されたファイルが残っている可能性がある」ことを stderr に明示して異常終了する（代替案は 7 節参照）。
+破損検出のタイミングは 2 段階になる。**転送経路の破損**（ビット化け、途中切断）は 4 の時点、つまり展開を始める前に検出できるため、作業ディレクトリは汚れない。一方 `cafce-content-sha256` の不一致は展開後にしか判明せず、その時点でファイル木は既に書き換わっている。後者では「作業ディレクトリに中途半端に復元されたファイルが残っている可能性がある」ことを stderr に明示して異常終了する（代替案は 7 節参照）。ただしこの経路は、転送が健全でありながら内容が食い違う場合（S3 上のオブジェクトが cafce 以外に書き換えられた、あるいは古い cafce が別仕様で書いた）に限られる。
 
-### 6.9 stdout の意味論
+### 6.10 stdout の意味論
 
 `probe` の `true` / `false` に揃え、`store` / `restore` も stdout は 2 値のみとする。
 
@@ -240,7 +281,7 @@ S3 の user metadata はキーが `x-amz-meta-` 接頭辞付きで送られ、�
 
 いずれも正常系は exit 0 であり、CI スクリプトからは `$(cafce restore cafce.toml)` を条件分岐に使える。詳細な進捗（対象件数、アーカイブサイズ、選ばれた fallback キー等）は `log::info!` / `log::debug!` で出し、`RUST_LOG` で制御する。stdout には出さない。
 
-### 6.10 資格情報の露出対策
+### 6.11 資格情報の露出対策
 
 - `main.rs` の `store` / `restore` にある `println!("{config:#?}")` / `println!("{env:#?}")` / `println!("{setting:#?}")` を削除する
 - `Env` から `#[derive(Debug)]` を外し、`aws_access_key` / `aws_secret_key` / `aws_session_token` を固定文字列（例: `"***"`）に置き換える手書きの `Debug` 実装に差し替える。値の有無だけは診断のため区別できるようにする（未設定は `None` のまま表示する）
@@ -248,7 +289,7 @@ S3 の user metadata はキーが `x-amz-meta-` 接頭辞付きで送られ、�
 
 `Env` の `Debug` を単に削除するのではなく redact 版を残すのは、`#[derive(serde::Deserialize)]` を持つ構造体を `.context()` 等で診断表示したい場面が今後も出るためで、そのたびに `Debug` の有無で悩まないようにするためである。
 
-### 6.11 依存 crate
+### 6.12 依存 crate
 
 | crate | 用途 | 備考 |
 |---|---|---|
@@ -256,10 +297,11 @@ S3 の user metadata はキーが `x-amz-meta-` 接頭辞付きで送られ、�
 | `zstd` | zstd 圧縮・展開 | C の libzstd を同梱ビルドする。ビルドに C コンパイラが要る |
 | `walkdir` | ディレクトリの再帰列挙 | シンボリックリンクを辿らない設定で使う |
 | `tempfile` | アーカイブの一時ファイル | 現在 dev-dependencies にあるものを dependencies へ移す |
+| `aws-smithy-types` | チェックサム値の Base64 エンコード（`aws_smithy_types::base64::encode`） | 既に `aws-sdk-s3` の依存として解決済みのものを直接依存として宣言するだけで、ビルド対象は増えない。`base64` crate を新規に足す代替もあるが、SDK と同じ実装を使う方が値の食い違いを起こしにくい |
 
 アーカイブのバイト列は zstd のバージョンに依存するため、これらは `=` でパッチバージョンまで完全固定する（プロジェクトの Rust 規約の「依存 crate の semver を信用しない」に沿う）。内容ハッシュは tar ストリームに対して取るので、zstd 更新時に再アップロードが誘発されることはないが、「同じ入力から同じ本体バイト列」という性質を意図せず失わないよう固定しておく。
 
-### 6.12 モジュール境界とエラー型
+### 6.13 モジュール境界とエラー型
 
 - `path_matcher` / `archive` / `cache_metadata` はローカル完結。回復不能な設定ミス・破損は `error.rs` に typed error として足し、呼び出し側で `anyhow::Context` を付けて文脈を積む
 - `store` / `restore` は `async fn`。`main.rs` の tokio runtime 上で駆動する。アーカイブの生成・展開は同期 I/O だが、CLI として 1 コマンド 1 処理のため `spawn_blocking` は入れない（並行性が無く、ブロックしても他のタスクを妨げない）
@@ -280,7 +322,7 @@ S3 の user metadata はキーが `x-amz-meta-` 接頭辞付きで送られ、�
 - zstd のバージョン・圧縮レベル・スレッド数が変わると、内容が同じでもハッシュが変わる。cafce のバージョンが混在した CI 群では、ジョブが走るたびに交互に再アップロードが起きうる
 - 「キャッシュの中身が同じか」という問いに対して、圧縮方式という無関係な軸が混ざる
 
-**判断**: 不採用。metadata ハッシュの主目的は無駄なアップロードの抑止であり、内容の同一性を表す軸であるべき。転送経路の破損検出は zstd のフレームチェックサムで足りる。
+**判断**: 不採用。metadata ハッシュの主目的は無駄なアップロードの抑止であり、内容の同一性を表す軸であるべき。ここで挙げた Pros（転送破損の早期検出）は、6.7 の S3 フレキシブルチェックサムを併用することで metadata ハッシュの軸を変えずに得られる。
 
 ### 代替案2: tar の mtime を実際の値のまま保存する
 
@@ -394,6 +436,35 @@ S3 の user metadata はキーが `x-amz-meta-` 接頭辞付きで送られ、�
 
 **判断**: 不採用。
 
+### 代替案10: S3 フレキシブルチェックサムに一本化し、metadata ハッシュを持たない
+
+**Pros**
+
+- ハッシュを 1 本にできる。`store` は `head_object` で返る `x-amz-checksum-sha256` と、これからアップロードするバイト列のチェックサムを比べるだけでよい
+- 仕様を自前で定義しなくてよく、S3 のコンソールや CLI からも見える
+
+**Cons**
+
+- チェックサムの対象はオブジェクト本体（tar.zst）なので、代替案1 と同じ問題を抱える。zstd の版数・レベルが変われば内容が同じでも値が変わり、再アップロードが誘発される
+- `head_object` でチェックサムを取得するには `ChecksumMode` の指定が要り、S3 互換サーバが未対応だと重複判定そのものが機能しなくなる（metadata なら単なる文字列なので、対応の有無に左右されにくい）
+- issue #7 の完了定義が metadata 文字列の仕様定義を求めている
+
+**判断**: 不採用。ただし対立する案ではないため、**併用**する（6.7）。破損検出はフレキシブルチェックサム、内容同一性は metadata ハッシュ、と役割を分ける。
+
+### 代替案11: チェックサム値を事前計算せず、SDK の自動計算（トレーラ形式）に任せる
+
+**Pros**
+
+- `checksum_algorithm` を指定するだけでよく、cafce 側でハッシュ器を 1 本減らせる
+- AWS SDK for Rust は既定でチェックサム（CRC-32）を付けるため、何も指定しなくても最低限の保護は得られる
+
+**Cons**
+
+- ストリーミングボディでは `aws-chunked` エンコーディングのトレーラとして送られる。この形式は S3 互換サーバでの対応差が大きく、cafce が主用途として想定するセルフホスト環境（ローカル RustFS を含む）で弾かれるリスクがある
+- 事前計算した値を渡す場合と違い、送信前に「自分が何を送ったか」を cafce 側のログに残せない
+
+**判断**: 不採用。圧縮後バイト列のハッシュ計算は、一時ファイルへ書き出す過程にハッシュ器を 1 本足すだけで済み、追加コストがほぼ無い。互換性を優先して事前計算値を渡す。
+
 ## 8. Concerns (懸念事項)
 
 - **単一 `PutObject` の 5 GiB 上限**: `target/` 丸ごとのようなキャッシュは容易に GB 級になる。上限を超えた場合、SDK のエラーが分かりにくい形で出る可能性がある
@@ -403,7 +474,11 @@ S3 の user metadata はキーが `x-amz-meta-` 接頭辞付きで送られ、�
 - **mtime 正規化と差分ビルドの相互作用**: 6.5 の方針でも、キャッシュ対象にソースと成果物の両方が含まれる構成では、復元後に両者が同一時刻になり判定が不安定になりうる
   - 緩和策: README で「`paths` にはビルド成果物・依存キャッシュを入れ、リポジトリの作業ツリーそのものは入れない」ことを推奨として明記する
 - **クロスプラットフォームでのハッシュ差**: Windows では実行ビットが取得できず、Unix で `0o755` になるファイルが `0o644` になる。同一内容でも OS 間でハッシュが割れる
-  - 緩和策: 現状は許容し、README に「異なる OS のランナー間でキャッシュを共有すると再アップロードが起きうる」ことを記載する
+  - これは Non-Goal に挙げたとおり**制約として受け入れる**。影響は「OS 混在のランナー間でキャッシュを共有したときに再アップロードが起きる」ことに限られ、正しさは損なわれない。README にその旨を記載するに留める
+- **S3 互換サーバのフレキシブルチェックサム対応**: RustFS が `x-amz-checksum-sha256` を受け付け、保管し、`GetObject` で返すかは実機確認が要る。受け付けない実装では `PutObject` 自体が失敗する可能性がある
+  - 緩和策: 統合テストで最初に確認する。もし RustFS が非対応なら、チェックサム指定を環境変数で無効化できる逃げ道（例: `CAFCE_S3_CHECKSUM=off`）の追加を検討する。現時点では対応を前提に設計し、余計な設定項目は増やさない
+- **ハッシュ計算の二重化**: `store` では tar ストリームと圧縮後バイト列の 2 本の SHA-256 を計算する
+  - 緩和策: どちらもアーカイブを一時ファイルへ書き出す 1 パスの中で計算するため、ファイルの読み直しは発生しない。SHA-256 の計算コストは zstd 圧縮と比べて小さい
 - **同一キーへの並行 `store`**: 内容が異なる 2 ジョブが同時に走ると last-write-wins になり、直後の `restore` がどちらを引くか不定になる
   - 緩和策: キャッシュの意味論上、どちらが残っても正しさは損なわれない（次のジョブが再度 `store` する）ため許容する
 - **`restore` 中断時の中途半端な木**: ネットワーク断や検証失敗で展開が途中で止まると、作業ディレクトリに一部だけ復元されたファイルが残る
@@ -424,7 +499,7 @@ S3 の user metadata はキーが `x-amz-meta-` 接頭辞付きで送られ、�
 - `path_matcher`: ファイル指定、ディレクトリ指定（再帰）、ワイルドカード、重複排除、ソート順、絶対パス拒否、基準ディレクトリ外への脱出拒否、0 件マッチ、シンボリックリンクを辿らないこと
 - `archive`: 同一入力から 2 回生成してバイト一致すること、mtime だけ変えても一致すること、ファイルの列挙順を変えても一致すること、uid/gid/umask の差が出ないこと（正規化されたヘッダ値の確認）、ラウンドトリップ（生成 → 展開）で内容・実行ビット・シンボリックリンク・空ディレクトリが復元されること
 - `archive`（展開の安全性）: `../` を含むエントリ、絶対パスのエントリ、外部を指すシンボリックリンクを持つ細工済み tar を拒否すること
-- `cache_metadata`: メタデータの生成・パース、未知スキーマ版数の検出、メタデータ欠落時の扱い
+- `cache_metadata`: メタデータの生成・パース、未知スキーマ版数の検出、メタデータ欠落時の扱い、圧縮後バイト列の SHA-256 を S3 が要求する Base64 形式へ変換する処理（既知値による回帰テストを含む）
 - `env`: `Debug` 出力に secret が含まれないこと
 - `setting`: `paths` の意味論に関するパース・バリデーション
 
@@ -438,6 +513,8 @@ S3 の user metadata はキーが `x-amz-meta-` 接頭辞付きで送られ、�
 - primary miss・fallback hit のときに fallback のアーカイブが展開される
 - 全 miss のときに `restore` が `false` を返し exit 0 になる
 - user metadata が rustfs でラウンドトリップすること
+- `x-amz-checksum-sha256` 付きの `PutObject` が rustfs で受理され、`HeadObject` / `GetObject` で値が返ること（返らない場合も `store` / `restore` が成立することを併せて確認する）
+- 意図的に壊した値をチェックサムとして渡した `PutObject` が拒否されること（サーバ側照合が実際に効いていることの確認）
 
 **AWS 実機テスト**
 
@@ -461,6 +538,9 @@ Rust の型システムを引き続き活用する。特に本フェーズでは
 
 - [Amazon S3 のオブジェクトメタデータ](https://docs.aws.amazon.com/AmazonS3/latest/userguide/UsingMetadata.html) — user metadata のキー形式（`x-amz-meta-`）、小文字化、2 KB 上限
 - [Amazon S3 PutObject](https://docs.aws.amazon.com/AmazonS3/latest/API/API_PutObject.html) — 単一 PUT の 5 GiB 上限
+- [Checking object integrity in Amazon S3](https://docs.aws.amazon.com/AmazonS3/latest/userguide/checking-object-integrity.html) — フレキシブルチェックサムの対応アルゴリズム一覧と全体像
+- [Checking object integrity for data uploads in Amazon S3](https://docs.aws.amazon.com/AmazonS3/latest/userguide/checking-object-integrity-upload.html) — アップロード時のサーバ側再計算と `BadDigest`、full object / composite チェックサムの区別（SHA-256 は単一 PUT でのみ full object）、トレーラ形式のチェックサム
+- [Data integrity protection with checksums (AWS SDK)](https://docs.aws.amazon.com/sdk-for-java/latest/developer-guide/s3-checksums.html) — `ChecksumAlgorithm` / `ChecksumMode` の使い方、ダウンロード時の検証がボディ消費時に行われること、チェックサム無しオブジェクトでは検証が行われないこと
 - [GitLab CI/CD `cache:paths`](https://docs.gitlab.com/ci/yaml/#cachepaths) — キャッシュ対象の列挙とワイルドカードの意味論。cafce の `paths` の参照元
 - [Zstandard Compression Format (RFC 8878)](https://datatracker.ietf.org/doc/html/rfc8878) — フレーム構造とチェックサム。フレームにタイムスタンプが無いこと
 - [tar crate](https://docs.rs/tar/) — ヘッダの手組みと展開時のパス検証
@@ -479,3 +559,11 @@ Rust の型システムを引き続き活用する。特に本フェーズでは
 - `paths` の 0 件マッチ・空配列は `store` のエラーとした。キー計算側の `default` フォールバック（#6）とは別の判断軸として整理した（代替案8）
 - `restore` は `head_object` を挟まず `get_object` を直接試行する方針とした。必要な IAM 権限が変わらず、ヒット時のラウンドトリップが減るため
 - マルチパートアップロード未対応を Non-Goal とし、5 GiB 超過はアーカイブ生成後にサイズ確認して明示的なエラーにすることとした
+- S3 のフレキシブルチェックサム（アップロード時にサーバ側で再計算・照合する機能）を AWS ドキュメントと `aws-sdk-s3` 1.138.1 のソースで調査し、metadata ハッシュと**併用**する方針を追加した（6.7 / 代替案10・11）。調査で確認した事実は次のとおり:
+  - `PutObject` に事前計算したチェックサムを添えると S3 が再計算して照合し、不一致なら `BadDigest` で拒否する。値はオブジェクトと共に保管される
+  - `aws_sdk_s3::Client::put_object()` に `checksum_algorithm(ChecksumAlgorithm::Sha256)` と `checksum_sha256(<Base64>)`、`get_object()` / `head_object()` に `checksum_mode(ChecksumMode::Enabled)` が存在する。`GetObject` / `HeadObject` の出力には `checksum_sha256()` がある
+  - チェックサム値の形式は Base64（cafce の metadata は 16 進なので、両者を取り違えないよう形式を明記した）
+  - SDK の既定は `RequestChecksumCalculation::WhenSupported` / `ResponseChecksumValidation::WhenSupported` であり、無指定でも CRC-32 が付く。SHA-256 の明示指定はその上書きにあたる
+  - 値を渡さず算法だけ指定するとストリーミングボディでは `aws-chunked` トレーラ形式になる。S3 互換サーバでの対応差を避けるため、事前計算値を渡す形にした
+  - SHA-256 が「オブジェクト全体のチェックサム」として使えるのは単一 PUT のみ。マルチパート対応時はこの節の見直しが要る
+- クロスプラットフォームでのハッシュ差は、緩和策を講じる懸念事項ではなく**受け入れる制約**として Non-Goal に移した
