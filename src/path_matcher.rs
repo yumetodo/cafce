@@ -46,7 +46,7 @@ pub fn to_archive_path(relative_path: &std::path::Path) -> String {
 /// `Path::starts_with` は components 単位の**字句**比較であり、
 /// `/base/../etc` のようなパスでも `/base` で始まると判定してしまう。
 /// 脱出判定の前に必ずこれを通す。
-fn normalize_lexically(path: &std::path::Path) -> std::path::PathBuf {
+pub(crate) fn normalize_lexically(path: &std::path::Path) -> std::path::PathBuf {
     let mut normalized = std::path::PathBuf::new();
     for component in path.components() {
         match component {

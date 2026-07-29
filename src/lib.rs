@@ -1,3 +1,4 @@
+pub mod archive;
 pub mod cache_key;
 pub mod env;
 pub mod error;
