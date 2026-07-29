@@ -327,31 +327,39 @@ impl Env {
     }
 
     #[doc(hidden)]
-    pub fn new_for_test_with_bucket(
-        server_address: Option<String>,
-        access_key: Option<String>,
-        secret_key: Option<String>,
-        insecure: bool,
-        bucket: String,
-        s3_prefix: Option<String>,
-        s3_checksum: S3ChecksumMode,
-    ) -> Self {
+    pub fn new_for_test_with_bucket(params: TestEnvParams) -> Self {
         Self {
-            aws_server_address: server_address,
-            aws_access_key: access_key,
-            aws_secret_key: secret_key,
+            aws_server_address: params.server_address,
+            aws_access_key: params.access_key,
+            aws_secret_key: params.secret_key,
             aws_session_token: None,
             aws_role_arn: None,
             aws_role_session_name: None,
             aws_profile: None,
-            aws_insecure: insecure,
-            aws_region: None,
+            aws_insecure: params.insecure,
+            aws_region: params.region,
             aws_force_path_style: None,
-            aws_bucket: Some(bucket),
-            s3_prefix,
-            s3_checksum,
+            aws_bucket: Some(params.bucket),
+            s3_prefix: params.s3_prefix,
+            s3_checksum: params.s3_checksum,
         }
     }
+}
+
+/// `Env::new_for_test_with_bucket` に渡すパラメータ
+///
+/// 統合テスト（`tests/` 配下）から `Env` を組み立てるための入口。項目数が多く
+/// 位置引数では取り違えやすいため、Parameter struct として受け取る。
+#[doc(hidden)]
+pub struct TestEnvParams {
+    pub server_address: Option<String>,
+    pub access_key: Option<String>,
+    pub secret_key: Option<String>,
+    pub insecure: bool,
+    pub region: Option<String>,
+    pub bucket: String,
+    pub s3_prefix: Option<String>,
+    pub s3_checksum: S3ChecksumMode,
 }
 
 #[cfg(test)]

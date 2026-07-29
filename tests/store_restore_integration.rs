@@ -8,21 +8,26 @@
 /// cargo test store_restore_integration -- --ignored --nocapture
 /// ```
 ///
+/// 同じファイルの後半には実 AWS S3 宛の `aws_integration_tests` があるため、
+/// `--test store_restore_integration -- --ignored` のようにファイル単位で指定すると
+/// そちらまで走ってしまう。上のようにモジュール名でフィルタして実行すること。
+///
 /// RustFS は beta 段階で実運用実績が少ないため、user metadata のラウンドトリップや
 /// フレキシブルチェックサムの挙動が仕様どおりとは限らない。設計doc 10 節のとおり、
 /// ここで実際のラウンドトリップを確認することを前提としている。
 #[cfg(test)]
 mod store_restore_integration_tests {
     fn rustfs_env(bucket: &str, s3_checksum: cafce::env::S3ChecksumMode) -> cafce::env::Env {
-        cafce::env::Env::new_for_test_with_bucket(
-            Some("localhost:9000".to_string()),
-            Some("cafce-dev-access-key".to_string()),
-            Some("cafce-dev-secret-key".to_string()),
-            true,
-            bucket.to_string(),
-            None,
+        cafce::env::Env::new_for_test_with_bucket(cafce::env::TestEnvParams {
+            server_address: Some("localhost:9000".to_string()),
+            access_key: Some("cafce-dev-access-key".to_string()),
+            secret_key: Some("cafce-dev-secret-key".to_string()),
+            insecure: true,
+            region: None,
+            bucket: bucket.to_string(),
+            s3_prefix: None,
             s3_checksum,
-        )
+        })
     }
 
     fn unique_name(prefix: &str) -> String {
@@ -503,5 +508,129 @@ mod store_restore_integration_tests {
                 .contains("キャッシュ対象の解決に失敗しました"));
         })
         .await;
+    }
+}
+
+/// 実際の AWS S3 に対する store / restore のラウンドトリップ確認。
+///
+/// このモジュールのテストは通常の `cargo test` 実行ではスキップされる（`#[ignore]` 指定）。
+/// RustFS 向けの `store_restore_integration_tests` とは完全に独立しており、
+/// 実際の AWS アカウント上に用意したテスト専用の S3 バケットを使用する。
+/// 署名・metadata の正規化・リージョンといった、ここでのみ検出できる差異を拾うためのものである。
+///
+/// 必要な AWS リソースと権限は `src/s3_client.rs` の `aws_integration_tests` と同じだが、
+/// `store` はオブジェクトを作成するため `s3:PutObject` が追加で必要になる。
+///
+/// 実行に必要な環境変数:
+/// - `CAFCE_AWS_ACCESS_KEY` - IAM ユーザーのアクセスキー ID
+/// - `CAFCE_AWS_SECRET_KEY` - IAM ユーザーのシークレットアクセスキー
+/// - `CAFCE_AWS_REGION` - バケットのリージョン（例: "ap-northeast-1"）
+/// - `CAFCE_TEST_BUCKET` - テスト対象の既存 S3 バケット名
+///
+/// 実行方法:
+/// ```sh
+/// export CAFCE_AWS_ACCESS_KEY=...
+/// export CAFCE_AWS_SECRET_KEY=...
+/// export CAFCE_AWS_REGION=ap-northeast-1
+/// export CAFCE_TEST_BUCKET=...
+/// cargo test aws_integration -- --ignored --nocapture
+/// ```
+#[cfg(test)]
+mod aws_integration_tests {
+    /// 実 AWS S3 に対して store → restore のラウンドトリップを確認する
+    ///
+    /// バケットは既存のものを使い回すため、テスト後に自分が作ったオブジェクトだけを削除する
+    /// （`create_bucket` / `delete_bucket` は権限外のため呼ばない）。
+    #[tokio::test]
+    #[ignore]
+    async fn aws_store_restore_roundtrip_smoke_test() {
+        // Arrange
+        let access_key = std::env::var("CAFCE_AWS_ACCESS_KEY").unwrap_or_else(|_| {
+            panic!(
+                "環境変数CAFCE_AWS_ACCESS_KEYが設定されていません。\
+                 AWS疎通確認テストの実行にはIAMユーザーのアクセスキーIDが必要です。"
+            )
+        });
+        let secret_key = std::env::var("CAFCE_AWS_SECRET_KEY").unwrap_or_else(|_| {
+            panic!(
+                "環境変数CAFCE_AWS_SECRET_KEYが設定されていません。\
+                 AWS疎通確認テストの実行にはIAMユーザーのシークレットアクセスキーが必要です。"
+            )
+        });
+        let region = std::env::var("CAFCE_AWS_REGION").unwrap_or_else(|_| {
+            panic!(
+                "環境変数CAFCE_AWS_REGIONが設定されていません。\
+                 テスト対象バケットのリージョン（例: ap-northeast-1）を指定してください。"
+            )
+        });
+        let bucket = std::env::var("CAFCE_TEST_BUCKET").unwrap_or_else(|_| {
+            panic!(
+                "環境変数CAFCE_TEST_BUCKETが設定されていません。\
+                 テスト専用に用意した既存のS3バケット名を指定してください。"
+            )
+        });
+
+        // バケットを共有するため、project 名の方をユニーク化してキーの衝突を避ける
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock is before UNIX_EPOCH")
+            .as_nanos();
+        let project = format!("cafce-aws-store-test-{nanos}");
+        let object_key = format!("{project}/cache-v1");
+
+        let env = cafce::env::Env::new_for_test_with_bucket(cafce::env::TestEnvParams {
+            // server_address: AWS S3 のデフォルトエンドポイントを使う
+            server_address: None,
+            access_key: Some(access_key),
+            secret_key: Some(secret_key),
+            insecure: false,
+            region: Some(region),
+            bucket: bucket.clone(),
+            s3_prefix: None,
+            s3_checksum: cafce::env::S3ChecksumMode::Auto,
+        });
+        let client = cafce::s3_client::build_s3_client(&env)
+            .await
+            .expect("failed to build S3 client for AWS S3");
+        let setting = cafce::setting::Setting {
+            project: project.clone(),
+            paths: vec!["target".to_string()],
+            key: serde_either::StringOrStruct::String("cache-v1".to_string()),
+            fallback_keys: vec![],
+        };
+
+        let source_dir = tempfile::tempdir().unwrap();
+        let restore_dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(source_dir.path().join("target/debug")).unwrap();
+        std::fs::write(source_dir.path().join("target/debug/app"), "binary-aws").unwrap();
+
+        // Act
+        let uploaded = cafce::store::store(&setting, &env, &client, source_dir.path())
+            .await
+            .expect("store failed against AWS S3");
+        let skipped = cafce::store::store(&setting, &env, &client, source_dir.path())
+            .await
+            .expect("second store failed against AWS S3");
+        let restored = cafce::restore::restore(&setting, &env, &client, restore_dir.path())
+            .await
+            .expect("restore failed against AWS S3");
+
+        // 後始末（アサート前に行い、失敗してもオブジェクトを残さない）
+        client
+            .delete_object()
+            .bucket(&bucket)
+            .key(&object_key)
+            .send()
+            .await
+            .unwrap_or_else(|e| panic!("delete_object({bucket}/{object_key}) failed: {e:?}"));
+
+        // Assert
+        assert!(uploaded, "初回なのでアップロードされるはず");
+        assert!(!skipped, "内容が同一なのでアップロードは省略されるはず");
+        assert!(restored, "store 済みなので restore は true のはず");
+        assert_eq!(
+            std::fs::read_to_string(restore_dir.path().join("target/debug/app")).unwrap(),
+            "binary-aws"
+        );
     }
 }
