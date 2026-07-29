@@ -1,5 +1,6 @@
 pub mod archive;
 pub mod cache_key;
+pub mod cache_metadata;
 pub mod env;
 pub mod error;
 pub mod file_matcher;
