@@ -3,6 +3,7 @@ pub mod env;
 pub mod error;
 pub mod file_matcher;
 pub mod hash_calculator;
+pub mod path_matcher;
 pub mod probe;
 pub mod s3_client;
 pub mod setting;
