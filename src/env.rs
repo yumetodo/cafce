@@ -17,6 +17,22 @@ pub enum EnvError {
     MissingBucket,
 }
 
+/// S3 フレキシブルチェックサム（`x-amz-checksum-sha256`）の使い方
+///
+/// AWS S3 の拡張機能であり S3 互換サーバの対応状況はまちまちなため、
+/// 既定は「使えるなら使う」ベストエフォートとする。
+#[derive(serde::Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum S3ChecksumMode {
+    /// 使えるなら使う。非対応に起因すると判断できる失敗はチェックサム無しで 1 回だけ再試行する
+    Auto,
+    /// チェックサムを付けない。`restore` でも `checksum_mode` を指定しない
+    Off,
+    /// フォールバックしない。`store` の失敗はそのままエラー。
+    /// `restore` でサーバがチェックサムを返さなかった場合もエラーにする
+    Required,
+}
+
 fn default_insecure() -> bool {
     false
 }
@@ -25,7 +41,11 @@ fn default_force_path_style() -> Option<bool> {
     None
 }
 
-#[derive(serde::Deserialize, Debug)]
+fn default_s3_checksum() -> S3ChecksumMode {
+    S3ChecksumMode::Auto
+}
+
+#[derive(serde::Deserialize)]
 pub struct Env {
     /// S3互換サーバーのアドレス
     /// 例: "s3.amazonaws.com", "localhost:9000", "10.200.1.157:9000"
@@ -77,6 +97,38 @@ pub struct Env {
 
     /// S3オブジェクトキーの先頭に付ける任意のprefix（末尾スラッシュは正規化）
     s3_prefix: Option<String>,
+
+    /// S3フレキシブルチェックサムの挙動（auto / off / required）
+    #[serde(default = "default_s3_checksum")]
+    s3_checksum: S3ChecksumMode,
+}
+
+/// 資格情報をCIログへ露出させないための手書き`Debug`実装
+///
+/// アクセスキー・シークレットキー・セッショントークンは固定文字列に置き換える。
+/// 値の有無だけは診断のため区別できるよう、`None`は`None`のまま表示する。
+impl std::fmt::Debug for Env {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        fn redact(value: &Option<String>) -> Option<&'static str> {
+            value.as_ref().map(|_| "***")
+        }
+
+        f.debug_struct("Env")
+            .field("aws_server_address", &self.aws_server_address)
+            .field("aws_access_key", &redact(&self.aws_access_key))
+            .field("aws_secret_key", &redact(&self.aws_secret_key))
+            .field("aws_session_token", &redact(&self.aws_session_token))
+            .field("aws_role_arn", &self.aws_role_arn)
+            .field("aws_role_session_name", &self.aws_role_session_name)
+            .field("aws_profile", &self.aws_profile)
+            .field("aws_insecure", &self.aws_insecure)
+            .field("aws_region", &self.aws_region)
+            .field("aws_force_path_style", &self.aws_force_path_style)
+            .field("aws_bucket", &self.aws_bucket)
+            .field("s3_prefix", &self.s3_prefix)
+            .field("s3_checksum", &self.s3_checksum)
+            .finish()
+    }
 }
 
 fn normalize_s3_prefix(prefix: Option<String>) -> Option<String> {
@@ -111,6 +163,11 @@ impl Env {
 
     pub fn s3_prefix(&self) -> Option<&str> {
         self.s3_prefix.as_deref()
+    }
+
+    /// S3フレキシブルチェックサムの挙動を取得する
+    pub fn s3_checksum(&self) -> S3ChecksumMode {
+        self.s3_checksum
     }
 
     /// サーバーアドレスからエンドポイントURLを生成する
@@ -265,6 +322,7 @@ impl Env {
             aws_force_path_style: force_path_style,
             aws_bucket: None,
             s3_prefix: None,
+            s3_checksum: default_s3_checksum(),
         }
     }
 
@@ -276,6 +334,7 @@ impl Env {
         insecure: bool,
         bucket: String,
         s3_prefix: Option<String>,
+        s3_checksum: S3ChecksumMode,
     ) -> Self {
         Self {
             aws_server_address: server_address,
@@ -290,6 +349,7 @@ impl Env {
             aws_force_path_style: None,
             aws_bucket: Some(bucket),
             s3_prefix,
+            s3_checksum,
         }
     }
 }
@@ -317,6 +377,168 @@ mod tests {
             aws_force_path_style: force_path_style,
             aws_bucket: None,
             s3_prefix: None,
+            s3_checksum: default_s3_checksum(),
+        }
+    }
+
+    mod redacted_debug_tests {
+        use super::*;
+
+        /// 資格情報を全て埋めた`Env`を作る（redact対象が実際に埋まっている状態を作る）
+        fn create_env_with_secrets() -> Env {
+            Env {
+                aws_access_key: Some("AKIAIOSFODNN7EXAMPLE".to_string()),
+                aws_secret_key: Some("wJalrXUtnFEMI-K7MDENG-bPxRfiCYEXAMPLEKEY".to_string()),
+                aws_session_token: Some("FwoGZXIvYXdzEXAMPLESESSIONTOKEN".to_string()),
+                ..create_test_env(Some("localhost:9000"), true, None, None)
+            }
+        }
+
+        #[test]
+        fn test_debug_does_not_contain_access_key() {
+            // Arrange
+            let env = create_env_with_secrets();
+
+            // Act
+            let debug_output = format!("{env:?}");
+
+            // Assert
+            assert!(!debug_output.contains("AKIAIOSFODNN7EXAMPLE"));
+        }
+
+        #[test]
+        fn test_debug_does_not_contain_secret_key() {
+            // Arrange
+            let env = create_env_with_secrets();
+
+            // Act
+            let debug_output = format!("{env:?}");
+
+            // Assert
+            assert!(!debug_output.contains("wJalrXUtnFEMI-K7MDENG-bPxRfiCYEXAMPLEKEY"));
+        }
+
+        #[test]
+        fn test_debug_does_not_contain_session_token() {
+            // Arrange
+            let env = create_env_with_secrets();
+
+            // Act
+            let debug_output = format!("{env:?}");
+
+            // Assert
+            assert!(!debug_output.contains("FwoGZXIvYXdzEXAMPLESESSIONTOKEN"));
+        }
+
+        #[test]
+        fn test_debug_alternate_form_does_not_contain_secrets() {
+            // Arrange: `{:#?}`（pretty形式）でも redact が効くことを確認する
+            let env = create_env_with_secrets();
+
+            // Act
+            let debug_output = format!("{env:#?}");
+
+            // Assert
+            assert!(!debug_output.contains("AKIAIOSFODNN7EXAMPLE"));
+            assert!(!debug_output.contains("wJalrXUtnFEMI-K7MDENG-bPxRfiCYEXAMPLEKEY"));
+            assert!(!debug_output.contains("FwoGZXIvYXdzEXAMPLESESSIONTOKEN"));
+        }
+
+        #[test]
+        fn test_debug_shows_redaction_placeholder_when_set() {
+            // Arrange
+            let env = create_env_with_secrets();
+
+            // Act
+            let debug_output = format!("{env:?}");
+
+            // Assert: 値の有無は診断のため区別できる
+            assert!(debug_output.contains("aws_access_key: Some(\"***\")"));
+            assert!(debug_output.contains("aws_secret_key: Some(\"***\")"));
+            assert!(debug_output.contains("aws_session_token: Some(\"***\")"));
+        }
+
+        #[test]
+        fn test_debug_shows_none_for_unset_credentials() {
+            // Arrange: 資格情報が未設定の Env
+            let env = create_test_env(Some("localhost:9000"), true, None, None);
+
+            // Act
+            let debug_output = format!("{env:?}");
+
+            // Assert: 未設定は None のまま表示する
+            assert!(debug_output.contains("aws_access_key: None"));
+            assert!(debug_output.contains("aws_secret_key: None"));
+            assert!(debug_output.contains("aws_session_token: None"));
+        }
+
+        #[test]
+        fn test_debug_keeps_non_secret_fields_visible() {
+            // Arrange
+            let env = create_env_with_secrets();
+
+            // Act
+            let debug_output = format!("{env:?}");
+
+            // Assert: 診断に必要な非機密フィールドはそのまま見える
+            assert!(debug_output.contains("localhost:9000"));
+        }
+    }
+
+    mod s3_checksum_tests {
+        use super::*;
+
+        #[test]
+        fn test_default_is_auto() {
+            // Arrange
+            let env = create_test_env(None, false, None, None);
+
+            // Act
+            let mode = env.s3_checksum();
+
+            // Assert
+            assert_eq!(mode, S3ChecksumMode::Auto);
+        }
+
+        #[test]
+        fn test_deserialize_lowercase_values() {
+            // Arrange
+            let inputs = [
+                ("\"auto\"", S3ChecksumMode::Auto),
+                ("\"off\"", S3ChecksumMode::Off),
+                ("\"required\"", S3ChecksumMode::Required),
+            ];
+
+            for (json, expected) in inputs {
+                // Act
+                let parsed: S3ChecksumMode =
+                    parse_checksum_mode(json).expect("既知の値はパースできるはず");
+
+                // Assert
+                assert_eq!(parsed, expected, "input={json}");
+            }
+        }
+
+        #[test]
+        fn test_deserialize_unknown_value_is_error() {
+            // Arrange
+            let json = "\"yes\"";
+
+            // Act
+            let parsed = parse_checksum_mode(json);
+
+            // Assert
+            assert!(parsed.is_err());
+        }
+
+        /// `serde_json`を依存に持たないため、TOMLのvalueとしてデシリアライズする
+        fn parse_checksum_mode(quoted: &str) -> Result<S3ChecksumMode, toml::de::Error> {
+            let doc = format!("value = {quoted}");
+            #[derive(serde::Deserialize)]
+            struct Wrapper {
+                value: S3ChecksumMode,
+            }
+            toml::from_str::<Wrapper>(&doc).map(|w| w.value)
         }
     }
 

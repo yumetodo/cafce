@@ -17,6 +17,7 @@ mod probe_integration_tests {
             true,
             bucket.to_string(),
             None,
+            cafce::env::S3ChecksumMode::Auto,
         )
     }
 
