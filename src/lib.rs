@@ -7,6 +7,7 @@ pub mod file_matcher;
 pub mod hash_calculator;
 pub mod path_matcher;
 pub mod probe;
+pub mod restore;
 pub mod s3_client;
 pub mod setting;
 pub mod store;
