@@ -518,8 +518,9 @@ mod store_restore_integration_tests {
 /// 実際の AWS アカウント上に用意したテスト専用の S3 バケットを使用する。
 /// 署名・metadata の正規化・リージョンといった、ここでのみ検出できる差異を拾うためのものである。
 ///
-/// 必要な AWS リソースと権限は `src/s3_client.rs` の `aws_integration_tests` と同じだが、
-/// `store` はオブジェクトを作成するため `s3:PutObject` が追加で必要になる。
+/// 必要な AWS リソースと権限は `src/s3_client.rs` の `aws_integration_tests` と同じで、
+/// バケットの作成・削除は行わないため管理者権限は要らない
+/// （`s3:ListBucket` / `s3:GetObject` / `s3:PutObject` / `s3:DeleteObject` のみで通る）。
 ///
 /// 実行に必要な環境変数:
 /// - `CAFCE_AWS_ACCESS_KEY` - IAM ユーザーのアクセスキー ID

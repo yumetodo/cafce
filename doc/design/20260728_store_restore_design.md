@@ -663,5 +663,5 @@ RustFS（`1.0.0-beta.10`）に対する統合テストと、実際の CLI での
 **テスト結果**
 
 - 単体テスト 209 件・RustFS 統合テスト 10 件（`#[ignore]`）がすべて green。`cargo fmt --check` と `cargo clippy --tests --examples -- -Dclippy::all` は warning ゼロ
-- 実 AWS S3 宛のラウンドトリップテストは環境変数駆動の `#[ignore]` として追加したが、実行には管理者権限でのログインが要るため本作業では未実行
+- 実 AWS S3 宛のラウンドトリップテスト（環境変数駆動の `#[ignore]`）も pass した。バケットもロールも作らないため管理者権限でのログインは不要で、`cafce-test-user` の最小 IAM 権限（`s3:ListBucket` / `s3:GetObject` / `s3:PutObject` / `s3:DeleteObject`）だけで通る。**AWS 実機でも user metadata はラウンドトリップし、同一内容の再 `store` は省略された**（RustFS と挙動が一致し、署名・metadata の正規化・リージョン周りに実機固有の差異は出なかった）
 - CLI での end-to-end も確認した: `probe`（false）→ `store`（true）→ `store`（false、省略）→ `probe`（true）→ `restore`（true）。空ディレクトリ・シンボリックリンク・実行ビットが復元され、復元後の mtime は展開時刻になっていた
