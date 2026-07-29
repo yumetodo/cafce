@@ -9,3 +9,4 @@ pub mod path_matcher;
 pub mod probe;
 pub mod s3_client;
 pub mod setting;
+pub mod store;
