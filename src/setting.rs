@@ -498,7 +498,8 @@ key = { files = ["${CAFCE_TEST_GLOB_VAR}/*.lock"] }
 
         #[test]
         fn test_paths_accepts_multiple_glob_patterns() {
-            // Arrange
+            // Arrange: ディレクトリ名・ワイルドカード・別ディレクトリを混ぜる。
+            // key.files と違い件数上限が無いので、複数書けること自体を固定する
             let toml = r#"
 project = "my-app"
 key = "cache-v1"
@@ -508,14 +509,17 @@ paths = ["target", "**/*.lock", "node_modules"]
             // Act
             let result = Setting::new_from_str(toml);
 
-            // Assert
+            // Assert: 順序も含めて書いたままパースされる（解決とバリデーションは
+            // path_matcher の責務なので、ここでは値の受け渡しだけを見る）
             let setting = result.unwrap();
             assert_eq!(setting.paths, vec!["target", "**/*.lock", "node_modules"]);
         }
 
         #[test]
         fn test_paths_are_not_expanded() {
-            // Arrange: paths はファイルシステムパスなので ${VAR} 展開の対象外
+            // Arrange: project や key とは扱いが違い、paths は ${VAR} 展開しない。
+            // 展開してしまうと、キャッシュ対象が実行環境によって変わり
+            // store と restore で食い違う余地が生まれる（#6 で確定済みの方針）
             std::env::set_var("CAFCE_TEST_PATHS_VAR", "should-not-expand");
             let toml = r#"
 project = "my-app"
@@ -526,14 +530,14 @@ paths = ["${CAFCE_TEST_PATHS_VAR}/target"]
             // Act
             let result = Setting::new_from_str(toml);
 
-            // Assert
+            // Assert: 変数が定義済みでも展開されず、リテラルのまま残る
             let setting = result.unwrap();
             assert_eq!(setting.paths, vec!["${CAFCE_TEST_PATHS_VAR}/target"]);
         }
 
         #[test]
         fn test_paths_omitted_defaults_to_empty() {
-            // Arrange: 省略時は空配列（store ではエラーになる）
+            // Arrange: paths を書かない config（key / probe だけを使う運用では正当）
             let toml = r#"
 project = "my-app"
 key = "cache-v1"
@@ -542,7 +546,8 @@ key = "cache-v1"
             // Act
             let result = Setting::new_from_str(toml);
 
-            // Assert
+            // Assert: パース時点ではエラーにしない。store を実行したときに
+            // path_matcher が空を弾く、という分担にしている
             assert!(result.unwrap().paths.is_empty());
         }
     }
@@ -552,7 +557,7 @@ key = "cache-v1"
 
         #[test]
         fn test_primary_only_when_no_fallback() {
-            // Arrange
+            // Arrange: fallback_keys を書かない config
             let setting = Setting::new_from_str(
                 r#"
 project = "my-app"
@@ -566,13 +571,14 @@ key = "cache-v1"
                 .resolve_key_candidates(std::path::Path::new("."))
                 .unwrap();
 
-            // Assert
+            // Assert: primary だけの 1 要素になる。空や 0 要素になると
+            // probe / restore が何も試さず必ず miss する
             assert_eq!(candidates, vec!["cache-v1"]);
         }
 
         #[test]
         fn test_primary_comes_first_then_fallbacks_in_order() {
-            // Arrange
+            // Arrange: feature ブランチ → main → 既定、という典型的な優先順位
             let setting = Setting::new_from_str(
                 r#"
 project = "my-app"
@@ -587,7 +593,9 @@ fallback_keys = ["cache-main", "cache-default"]
                 .resolve_key_candidates(std::path::Path::new("."))
                 .unwrap();
 
-            // Assert
+            // Assert: primary が先頭で、fallback_keys は config に書いた順のまま。
+            // この並びが probe と restore の共通の試行順になるため、
+            // 入れ替わると「probe は true なのに restore が別のキャッシュを引く」が起きる
             assert_eq!(
                 candidates,
                 vec!["cache-feature", "cache-main", "cache-default"]
@@ -596,7 +604,9 @@ fallback_keys = ["cache-main", "cache-default"]
 
         #[test]
         fn test_files_based_key_is_computed_as_primary() {
-            // Arrange: 0 件マッチなので GitLab CI 互換の default フォールバックになる
+            // Arrange: key が files 形態の場合。literal String と違い primary は
+            // 計算結果になる。ここでは files が 0 件マッチなので、
+            // GitLab CI 互換の default フォールバックが効く
             let temp_dir = tempfile::tempdir().unwrap();
             let setting = Setting::new_from_str(
                 r#"
@@ -610,7 +620,8 @@ fallback_keys = ["cache-main"]
             // Act
             let candidates = setting.resolve_key_candidates(temp_dir.path()).unwrap();
 
-            // Assert
+            // Assert: 先頭は計算済みの文字列（prefix 付き）で、fallback_keys は
+            // そのまま後ろに続く。計算経路が resolve_primary_key と共通であることの確認
             assert_eq!(candidates, vec!["deps-default", "cache-main"]);
         }
     }

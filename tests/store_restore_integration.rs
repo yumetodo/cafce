@@ -57,6 +57,10 @@ mod store_restore_integration_tests {
     /// キャッシュ対象として使うファイル木を作る
     ///
     /// ファイル・ネストしたディレクトリ・空ディレクトリ・シンボリックリンクを含める。
+    /// tar のエントリ型を一通り通すことで、S3 を経由しても情報が落ちないことを確認する。
+    ///
+    /// `marker` は内容へ埋め込む識別子で、復元されたファイルがどの世代のものかを
+    /// 見分けるために使う（上書きテストで「古い内容が残っていない」ことを言うために要る）。
     fn create_source_tree(base_path: &std::path::Path, marker: &str) {
         std::fs::create_dir_all(base_path.join("target/debug")).unwrap();
         std::fs::create_dir_all(base_path.join("target/empty")).unwrap();
@@ -164,7 +168,8 @@ mod store_restore_integration_tests {
         create_source_tree(source_dir.path(), "roundtrip");
 
         with_bucket(&client, &bucket, || async {
-            // Act
+            // Act: store した木とは別ディレクトリへ restore する。同じ場所だと
+            // 元のファイルが残っているだけで通ってしまい、復元を確認できない
             let uploaded = cafce::store::store(&setting, &env, &client, source_dir.path())
                 .await
                 .unwrap();
@@ -175,7 +180,8 @@ mod store_restore_integration_tests {
                 .await
                 .unwrap();
 
-            // Assert
+            // Assert: probe も挟むのは「probe が true を返す状況では restore も必ず
+            // ヒットする」という不変条件（設計doc 6.9）を実機で確認するため
             assert!(uploaded, "初回なのでアップロードされるはず");
             assert!(probed, "store 済みなので probe は true のはず");
             assert!(restored, "store 済みなので restore は true のはず");
@@ -206,7 +212,8 @@ mod store_restore_integration_tests {
                 .await
                 .last_modified;
 
-            // Act: 内容を変えずに再実行する
+            // Act: ファイルを一切触らずに再実行する。アーカイブは決定論的なので
+            // 内容ハッシュも同じ値になり、metadata と一致するはず
             let second = cafce::store::store(&setting, &env, &client, source_dir.path())
                 .await
                 .unwrap();
@@ -214,7 +221,10 @@ mod store_restore_integration_tests {
                 .await
                 .last_modified;
 
-            // Assert
+            // Assert: 戻り値の false だけでは「PutObject を打たなかった」ことの証明に
+            // ならないので、LastModified が変わっていないことをサーバ側の事実として見る。
+            // これは同時に、RustFS が user metadata をラウンドトリップしていることの
+            // 裏付けにもなっている（返らなければハッシュ照合ができず必ず再送になる）
             assert!(first, "初回はアップロードされるはず");
             assert!(!second, "内容が同一なのでアップロードは省略されるはず");
             assert_eq!(
@@ -244,7 +254,9 @@ mod store_restore_integration_tests {
                 .await
                 .unwrap();
 
-            // Act: 内容を変えて再 store する
+            // Act: キーは変えずに中身だけ差し替える（同じブランチでコードが進んだ状況）。
+            // marker を "before" から "after" へ変えることで、restore 後に
+            // どちらの世代が入っているか判定できる
             std::fs::write(source_dir.path().join("target/debug/app"), "binary-after").unwrap();
             std::fs::write(source_dir.path().join("target/.fingerprint"), "after").unwrap();
             let second = cafce::store::store(&setting, &env, &client, source_dir.path())
@@ -254,7 +266,8 @@ mod store_restore_integration_tests {
                 .await
                 .unwrap();
 
-            // Assert
+            // Assert: 上書きされ、restore が新しい世代を返すこと。
+            // ハッシュ照合が雑だと古い内容のまま省略され、ここで "before" が出る
             assert!(second, "内容が変わったので上書きアップロードされるはず");
             assert_source_tree_restored(restore_dir.path(), "after");
         })
@@ -283,7 +296,9 @@ mod store_restore_integration_tests {
         create_source_tree(source_dir.path(), "fallback");
 
         with_bucket(&client, &bucket, || async {
-            // primary は置かず fallback だけ store する
+            // store 用と restore 用で別の Setting を使う。store は常に primary へ書くので、
+            // 「fallback にだけ存在する」状態を作るには primary key を cache-main にした
+            // Setting で store する必要がある
             cafce::store::store(&store_setting, &env, &client, source_dir.path())
                 .await
                 .unwrap();
@@ -294,7 +309,9 @@ mod store_restore_integration_tests {
                     .await
                     .unwrap();
 
-            // Assert
+            // Assert: primary が miss でも fallback のアーカイブが展開される。
+            // restore は paths を参照しないので、restore_setting の paths が空でも問題ない
+            // ——という設計もここで一緒に確認できている
             assert!(restored, "fallback key が存在するので true のはず");
             assert_source_tree_restored(restore_dir.path(), "fallback");
         })
@@ -319,12 +336,15 @@ mod store_restore_integration_tests {
         let restore_dir = tempfile::tempdir().unwrap();
 
         with_bucket(&client, &bucket, || async {
-            // Act: 何も store しない
+            // Act: バケットは作るが何も置かない。3 つのキー候補すべてが miss する
             let restored = cafce::restore::restore(&setting, &env, &client, restore_dir.path())
                 .await
                 .unwrap();
 
-            // Assert
+            // Assert: エラーではなく false + exit 0 相当（`unwrap()` が通ること自体が
+            // それを示す）。CI スクリプトが `$(cafce restore ...)` で分岐できる前提を守る。
+            // 併せて、miss の過程で一時ファイルや空ディレクトリを作業ディレクトリへ
+            // 撒いていないことも確認する
             assert!(!restored, "何も存在しないので false のはず");
             assert_eq!(
                 std::fs::read_dir(restore_dir.path()).unwrap().count(),
@@ -354,11 +374,14 @@ mod store_restore_integration_tests {
                 .await
                 .unwrap();
 
-            // Act
+            // Act: cafce 自身と同じ経路（parse_metadata）で読み返す
             let output = head_object(&client, &bucket, &object_key).await;
             let parsed = cafce::cache_metadata::parse_metadata(output.metadata()).unwrap();
 
-            // Assert
+            // Assert: 設計doc 8 節で「rustfs が user metadata を保持して返すかは
+            // 実機確認が要る」と挙げていた項目。返らなければ Ok(None) になり、
+            // 「メタデータ欠落 = 常に再アップロード」へ退化する（正しさは保たれるが
+            // アップロード省略が効かなくなる）
             let parsed = parsed.expect("user metadata がラウンドトリップしていない");
             assert_eq!(parsed.schema_version, cafce::cache_metadata::SCHEMA_VERSION);
             assert_eq!(parsed.archive_format, cafce::cache_metadata::ARCHIVE_FORMAT);
@@ -386,7 +409,8 @@ mod store_restore_integration_tests {
         let object_key = format!("{project}/cache-v1");
 
         with_bucket(&client, &bucket, || async {
-            // Act
+            // Act: CAFCE_S3_CHECKSUM=auto なので事前計算した x-amz-checksum-sha256 を
+            // 付けて PutObject する。非対応サーバならここでフォールバックが走る
             let uploaded = cafce::store::store(&setting, &env, &client, source_dir.path())
                 .await
                 .unwrap();
@@ -395,10 +419,14 @@ mod store_restore_integration_tests {
                 .await
                 .unwrap();
 
-            // Assert
+            // Assert: 受理されること自体（アーカイブ生成時に計算した値がサーバの
+            // 再計算と一致すること）がまず確認したい点。ずれていれば BadDigest になる
             assert!(uploaded, "チェックサム付きの PutObject が受理されるはず");
             assert!(restored);
             assert_source_tree_restored(restore_dir.path(), "checksum");
+            // 保管された値が HeadObject で返るかはサーバ実装依存なので、
+            // 返らないこと自体はテストの失敗にしない。フレキシブルチェックサムは
+            // あくまで上積みであり、内容の検証は metadata ハッシュが独立に担っている
             match output.checksum_sha256() {
                 Some(checksum) => {
                     assert_eq!(checksum.len(), 44, "32 バイトの Base64 は 44 文字のはず")
@@ -419,12 +447,14 @@ mod store_restore_integration_tests {
     #[tokio::test]
     #[ignore]
     async fn test_corrupted_checksum_is_rejected() {
-        // Arrange
+        // Arrange: cafce の store は正しい値しか送らないため、サーバ側照合が効いている
+        // ことを確かめるには SDK を直接叩いて意図的に壊した値を渡す必要がある
         let bucket = unique_name("cafce-store-test");
         let env = rustfs_env(&bucket, cafce::env::S3ChecksumMode::Auto);
         let client = cafce::s3_client::build_s3_client(&env).await.unwrap();
         let body: &[u8] = b"cafce-corrupted-checksum-test";
-        // 本文とは無関係な値（空文字列の SHA-256）を渡す
+        // 本文とは無関係な値（空文字列の SHA-256）。形式としては妥当な 44 文字なので、
+        // 「形式エラーで弾かれた」のではなく「照合して不一致だった」ことが分かる
         let wrong_checksum = "47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=";
 
         with_bucket(&client, &bucket, || async {
@@ -439,7 +469,9 @@ mod store_restore_integration_tests {
                 .send()
                 .await;
 
-            // Assert
+            // Assert: 拒否されれば BadDigest が返る想定。cafce 側はこのコードを
+            // 「非対応」ではなく「本物の破損」と解釈して再試行しない（store の
+            // should_retry_without_checksum と対応する実機側の裏付け）
             match result {
                 Err(e) => {
                     use aws_sdk_s3::error::ProvideErrorMetadata as _;
@@ -469,7 +501,8 @@ mod store_restore_integration_tests {
         create_source_tree(source_dir.path(), "checksum-off");
 
         with_bucket(&client, &bucket, || async {
-            // Act
+            // Act: Off なので PutObject に checksum を付けず、GetObject にも
+            // checksum_mode を指定しない
             let uploaded = cafce::store::store(&setting, &env, &client, source_dir.path())
                 .await
                 .unwrap();
@@ -477,7 +510,9 @@ mod store_restore_integration_tests {
                 .await
                 .unwrap();
 
-            // Assert
+            // Assert: チェックサム無しでも正しさは損なわれない（内容の検証は
+            // metadata ハッシュが独立に担う）。フレキシブルチェックサムに問題のある
+            // サーバに当たった利用者の逃げ道が実際に機能することの確認
             assert!(uploaded);
             assert!(restored);
             assert_source_tree_restored(restore_dir.path(), "checksum-off");
@@ -498,10 +533,12 @@ mod store_restore_integration_tests {
         let source_dir = tempfile::tempdir().unwrap();
 
         with_bucket(&client, &bucket, || async {
-            // Act
+            // Act: paths が空の Setting で store する
             let result = cafce::store::store(&setting, &env, &client, source_dir.path()).await;
 
-            // Assert
+            // Assert: path_matcher の単体テストと重複するが、store が実際に
+            // その検証を通していること（S3 へ空アーカイブを置いてしまわないこと）を
+            // 経路として確認する。context の文言で store 側の呼び出し箇所を特定できる
             assert!(result
                 .unwrap_err()
                 .to_string()
@@ -605,7 +642,8 @@ mod aws_integration_tests {
         std::fs::create_dir_all(source_dir.path().join("target/debug")).unwrap();
         std::fs::write(source_dir.path().join("target/debug/app"), "binary-aws").unwrap();
 
-        // Act
+        // Act: 実 AWS でのみ検出できる差異（署名、metadata の正規化、リージョン）を
+        // 1 本で拾いたいので、初回 store・省略される 2 回目・restore をまとめて通す
         let uploaded = cafce::store::store(&setting, &env, &client, source_dir.path())
             .await
             .expect("store failed against AWS S3");
@@ -625,7 +663,9 @@ mod aws_integration_tests {
             .await
             .unwrap_or_else(|e| panic!("delete_object({bucket}/{object_key}) failed: {e:?}"));
 
-        // Assert
+        // Assert: 2 回目が false になることが、AWS S3 でも user metadata が
+        // ラウンドトリップしている（＝小文字化などの正規化で読めなくなっていない）
+        // ことの裏付けになっている
         assert!(uploaded, "初回なのでアップロードされるはず");
         assert!(!skipped, "内容が同一なのでアップロードは省略されるはず");
         assert!(restored, "store 済みなので restore は true のはず");

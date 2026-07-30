@@ -217,6 +217,10 @@ pub async fn store(
 mod tests {
     use super::*;
 
+    /// 内容ハッシュとして形式が妥当な 2 値
+    ///
+    /// 「一致 / 不一致」を作り分けるだけなので値そのものに意味は無いが、
+    /// cache_metadata の形式検証（小文字 16 進 64 文字）を通る必要がある。
     const HASH_A: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
     const HASH_B: &str = "6ae8a75555209fd6c44157c0aed8016e763ff435a19cf186f76863140143ff72";
 
@@ -225,40 +229,45 @@ mod tests {
 
         #[test]
         fn test_bad_digest_is_not_retried() {
-            // Arrange: サーバが機能を理解したうえで内容の不一致を検出した結果
+            // Arrange: サーバが機能を理解したうえで内容の不一致を検出した結果。
+            // 400 番台なので、ステータスだけを見る実装だと非対応と誤認する
             let status = Some(400);
             let error_code = Some("BadDigest");
 
             // Act
             let retry = should_retry_without_checksum(status, error_code);
 
-            // Assert
+            // Assert: 本物の破損を意味するので再試行しない。チェックサム無しで送り直すと
+            // 壊れたキャッシュをサーバの検証をすり抜けて置いてしまう
             assert!(!retry);
         }
 
         #[test]
         fn test_access_denied_is_not_retried() {
-            // Arrange
+            // Arrange: 権限不足。これも 400 番台に含まれる
             let status = Some(403);
             let error_code = Some("AccessDenied");
 
             // Act
             let retry = should_retry_without_checksum(status, error_code);
 
-            // Assert
+            // Assert: チェックサムを外しても通らないので、再試行は無駄なリクエストになるだけ。
+            // 権限不足という本当の原因をエラーとして見せる
             assert!(!retry);
         }
 
         #[test]
         fn test_invalid_request_is_retried() {
-            // Arrange
+            // Arrange: チェックサム非対応のサーバが返しうるコード。
+            // 実際にどれが返るかはサーバ実装依存なので広めに拾う
             let status = Some(400);
             let error_code = Some("InvalidRequest");
 
             // Act
             let retry = should_retry_without_checksum(status, error_code);
 
-            // Assert
+            // Assert: ここだけがフォールバックする経路。判定を誤って不要に
+            // フォールバックしても metadata の内容ハッシュ検証が残るため安全側に倒れる
             assert!(retry);
         }
 
@@ -290,46 +299,51 @@ mod tests {
 
         #[test]
         fn test_server_error_is_not_retried() {
-            // Arrange: 5xx は非対応ではなくサーバ側の障害
+            // Arrange: 5xx は非対応ではなくサーバ側の一時障害
             let status = Some(500);
             let error_code = Some("InternalError");
 
             // Act
             let retry = should_retry_without_checksum(status, error_code);
 
-            // Assert
+            // Assert: チェックサムを外して再試行すると、たまたま成功したときに
+            // 「このサーバは非対応」という誤った学習をしたのと同じ結果になる。
+            // 一時障害の再送は SDK のリトライに任せる
             assert!(!retry);
         }
 
         #[test]
         fn test_network_error_without_response_is_not_retried() {
-            // Arrange: レスポンスが無い（接続失敗・タイムアウト）
+            // Arrange: HTTP レスポンスに到達しなかった場合（接続失敗・タイムアウト）。
+            // SdkError からステータスもコードも取れない
             let status: Option<u16> = None;
             let error_code: Option<&str> = None;
 
             // Act
             let retry = should_retry_without_checksum(status, error_code);
 
-            // Assert
+            // Assert: 情報が無いときは非対応と決めつけない（既定で安全側）
             assert!(!retry);
         }
 
         #[test]
         fn test_unknown_client_error_code_is_not_retried() {
-            // Arrange: 400 系でもチェックサムと無関係なコードは再試行しない
+            // Arrange: 400 番台だがチェックサムと無関係な失敗（バケット名の間違い等）
             let status = Some(404);
             let error_code = Some("NoSuchBucket");
 
             // Act
             let retry = should_retry_without_checksum(status, error_code);
 
-            // Assert
+            // Assert: 既知のコードだけを許可リストで拾う。「400 番台なら全部再試行」に
+            // すると、設定ミスの本当の原因が 2 回目の失敗で上書きされて分かりにくくなる
             assert!(!retry);
         }
 
         #[test]
         fn test_bad_digest_without_status_is_not_retried() {
-            // Arrange: BadDigest はステータスによらず再試行しない
+            // Arrange: BadDigest の判定をステータス検査より前に置いていることの確認。
+            // 順序が逆だと、ステータスが取れないケースで BadDigest の意図が失われる
             let status: Option<u16> = None;
             let error_code = Some("BadDigest");
 
@@ -346,65 +360,73 @@ mod tests {
 
         #[test]
         fn test_missing_object_needs_upload() {
-            // Arrange: head_object が 404
+            // Arrange: head_object が 404（そのキーに何も置かれていない初回）
             let existing_metadata = None;
 
             // Act
             let needed = needs_upload(existing_metadata, HASH_A);
 
-            // Assert
+            // Assert: 比較対象が無いのでアップロードする
             assert!(needed);
         }
 
         #[test]
         fn test_matching_hash_skips_upload() {
-            // Arrange
+            // Arrange: 既存オブジェクトと、これから送ろうとしている内容のハッシュが同じ。
+            // literal String のキー（`cache-${CI_COMMIT_REF_SLUG}` 等）で
+            // 同じブランチのジョブが何度も走る典型ケース
             let existing_metadata = crate::cache_metadata::build_metadata(HASH_A);
 
             // Act
             let needed = needs_upload(Some(&existing_metadata), HASH_A);
 
-            // Assert
+            // Assert: この 1 件だけが省略される経路。並列度の高い CI では
+            // 同一内容のアップロードが人数分走って帯域を食うため、ここが効く
             assert!(!needed);
         }
 
         #[test]
         fn test_mismatching_hash_needs_upload() {
-            // Arrange
+            // Arrange: キーは同じだが中身が変わった（ブランチは同じでコードが進んだ）
             let existing_metadata = crate::cache_metadata::build_metadata(HASH_A);
 
             // Act
             let needed = needs_upload(Some(&existing_metadata), HASH_B);
 
-            // Assert
+            // Assert: 上書きする
             assert!(needed);
         }
 
         #[test]
         fn test_absent_metadata_needs_upload() {
-            // Arrange: cafce 以外が置いたオブジェクト
+            // Arrange: オブジェクトはあるが cafce の metadata が無い
+            // （`aws s3 cp` で手置きした、あるいは user metadata を保持しないサーバ）
             let existing_metadata = std::collections::HashMap::new();
 
             // Act
             let needed = needs_upload(Some(&existing_metadata), HASH_A);
 
-            // Assert
+            // Assert: 比較できないので上書きする。metadata が返らないサーバでは
+            // 毎回アップロードになるが、正しさは保たれる（省略が効かないだけ）
             assert!(needed);
         }
 
         #[test]
         fn test_unparsable_metadata_needs_upload() {
-            // Arrange: 未知のスキーマ版数（新しい cafce が置いた可能性がある）
+            // Arrange: 未知のスキーマ版数。新しい cafce が先に走った状況で、
+            // restore ならエラーにする入力
             let mut existing_metadata = crate::cache_metadata::build_metadata(HASH_A);
             existing_metadata.insert(
                 crate::cache_metadata::KEY_SCHEMA_VERSION.to_string(),
                 "999".to_string(),
             );
 
-            // Act: last-write-wins が前提なので CI を止めず上書きする
+            // Act
             let needed = needs_upload(Some(&existing_metadata), HASH_A);
 
-            // Assert
+            // Assert: store では読み取りと違ってエラーにしない。同一キーへの store は
+            // last-write-wins が前提であり、新しい cafce が先に走ったというだけで
+            // CI を落とす方が害が大きいと判断した（設計doc の Non-Goal と対応）
             assert!(needed);
         }
     }

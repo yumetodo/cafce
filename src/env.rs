@@ -392,7 +392,11 @@ mod tests {
     mod redacted_debug_tests {
         use super::*;
 
-        /// 資格情報を全て埋めた`Env`を作る（redact対象が実際に埋まっている状態を作る）
+        /// redact 対象の 3 フィールドが実際に埋まった `Env` を作る
+        ///
+        /// 値は AWS のドキュメントに載っているサンプル資格情報で、本物ではない。
+        /// 「redact されていれば Debug 出力に 1 文字も現れない」ことを部分一致で
+        /// 検査したいので、他のフィールドと偶然衝突しない特徴的な文字列を選んでいる。
         fn create_env_with_secrets() -> Env {
             Env {
                 aws_access_key: Some("AKIAIOSFODNN7EXAMPLE".to_string()),
@@ -404,31 +408,33 @@ mod tests {
 
         #[test]
         fn test_debug_does_not_contain_access_key() {
-            // Arrange
+            // Arrange: アクセスキーが設定された Env
             let env = create_env_with_secrets();
 
-            // Act
+            // Act: CI ログへ流れるのと同じ経路（Debug 出力）を文字列として取る
             let debug_output = format!("{env:?}");
 
-            // Assert
+            // Assert: #6 で申し送られた「アクセスキーが stdout へ露出する」不具合の再発防止。
+            // 値そのものが 1 箇所も現れてはならない
             assert!(!debug_output.contains("AKIAIOSFODNN7EXAMPLE"));
         }
 
         #[test]
         fn test_debug_does_not_contain_secret_key() {
-            // Arrange
+            // Arrange: シークレットキーが設定された Env
             let env = create_env_with_secrets();
 
             // Act
             let debug_output = format!("{env:?}");
 
-            // Assert
+            // Assert: 3 フィールドを個別のテストに分けているのは、
+            // 1 つだけ redact を書き忘れた退行を取り違えなく検出したいため
             assert!(!debug_output.contains("wJalrXUtnFEMI-K7MDENG-bPxRfiCYEXAMPLEKEY"));
         }
 
         #[test]
         fn test_debug_does_not_contain_session_token() {
-            // Arrange
+            // Arrange: セッショントークンが設定された Env
             let env = create_env_with_secrets();
 
             // Act
@@ -440,10 +446,11 @@ mod tests {
 
         #[test]
         fn test_debug_alternate_form_does_not_contain_secrets() {
-            // Arrange: `{:#?}`（pretty形式）でも redact が効くことを確認する
+            // Arrange: 露出していた仮実装は `{env:#?}`（pretty 形式）を使っていた
             let env = create_env_with_secrets();
 
-            // Act
+            // Act: `{:?}` と `{:#?}` は同じ `Debug::fmt` を通るが、
+            // 手書き実装で分岐を書き間違えると片方だけ漏れうるため両方を検査する
             let debug_output = format!("{env:#?}");
 
             // Assert
@@ -454,13 +461,15 @@ mod tests {
 
         #[test]
         fn test_debug_shows_redaction_placeholder_when_set() {
-            // Arrange
+            // Arrange: 資格情報あり
             let env = create_env_with_secrets();
 
             // Act
             let debug_output = format!("{env:?}");
 
-            // Assert: 値の有無は診断のため区別できる
+            // Assert: フィールドをまるごと消すのではなく `Some("***")` に置き換える。
+            // 「設定されているが伏せた」と「未設定」を診断で読み分けられるようにするためで、
+            // 次のテスト（未設定は None のまま）と対で意味を持つ
             assert!(debug_output.contains("aws_access_key: Some(\"***\")"));
             assert!(debug_output.contains("aws_secret_key: Some(\"***\")"));
             assert!(debug_output.contains("aws_session_token: Some(\"***\")"));
@@ -468,13 +477,14 @@ mod tests {
 
         #[test]
         fn test_debug_shows_none_for_unset_credentials() {
-            // Arrange: 資格情報が未設定の Env
+            // Arrange: 資格情報が 1 つも設定されていない Env
             let env = create_test_env(Some("localhost:9000"), true, None, None);
 
             // Act
             let debug_output = format!("{env:?}");
 
-            // Assert: 未設定は None のまま表示する
+            // Assert: 未設定を `Some("***")` に潰してしまうと
+            // 「キーを渡し忘れた」のか「渡したが伏せられた」のか区別できなくなる
             assert!(debug_output.contains("aws_access_key: None"));
             assert!(debug_output.contains("aws_secret_key: None"));
             assert!(debug_output.contains("aws_session_token: None"));
@@ -482,13 +492,14 @@ mod tests {
 
         #[test]
         fn test_debug_keeps_non_secret_fields_visible() {
-            // Arrange
+            // Arrange: エンドポイントは "localhost:9000" にしてある
             let env = create_env_with_secrets();
 
             // Act
             let debug_output = format!("{env:?}");
 
-            // Assert: 診断に必要な非機密フィールドはそのまま見える
+            // Assert: 安全側に振り切って全フィールドを伏せると Debug 実装を残す意味が無い。
+            // 接続先のような非機密フィールドは診断のためそのまま見えること
             assert!(debug_output.contains("localhost:9000"));
         }
     }
@@ -498,19 +509,21 @@ mod tests {
 
         #[test]
         fn test_default_is_auto() {
-            // Arrange
+            // Arrange: CAFCE_S3_CHECKSUM を設定していない環境を模した Env
             let env = create_test_env(None, false, None, None);
 
             // Act
             let mode = env.s3_checksum();
 
-            // Assert
+            // Assert: 既定はベストエフォート。ここが Off に退行すると
+            // 何も設定していない利用者のチェックサム検証が黙って外れる
             assert_eq!(mode, S3ChecksumMode::Auto);
         }
 
         #[test]
         fn test_deserialize_lowercase_values() {
-            // Arrange
+            // Arrange: 環境変数として渡される 3 値。README に小文字で書いているため、
+            // `#[serde(rename_all = "lowercase")]` が外れていないことを固定する
             let inputs = [
                 ("\"auto\"", S3ChecksumMode::Auto),
                 ("\"off\"", S3ChecksumMode::Off),
@@ -529,17 +542,22 @@ mod tests {
 
         #[test]
         fn test_deserialize_unknown_value_is_error() {
-            // Arrange
+            // Arrange: `off` のつもりで書きそうな綴り違い
             let json = "\"yes\"";
 
             // Act
             let parsed = parse_checksum_mode(json);
 
-            // Assert
+            // Assert: 未知の値を既定値へ黙って倒すと、`required` を指定したつもりで
+            // 検証が外れている状態に気づけない。設定ミスは起動時に落とす
             assert!(parsed.is_err());
         }
 
-        /// `serde_json`を依存に持たないため、TOMLのvalueとしてデシリアライズする
+        /// 引用符付きの値 1 つを `S3ChecksumMode` としてデシリアライズする
+        ///
+        /// 本番の入力経路は envy（環境変数）だが、envy はプロセス全体の環境変数を読むため
+        /// 単体テストから 1 値だけを与えられない。`serde_json` は依存に無いので、
+        /// 同じ `Deserialize` 実装を通せる TOML の value として読ませている。
         fn parse_checksum_mode(quoted: &str) -> Result<S3ChecksumMode, toml::de::Error> {
             let doc = format!("value = {quoted}");
             #[derive(serde::Deserialize)]

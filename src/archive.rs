@@ -647,6 +647,8 @@ mod tests {
     use super::*;
 
     /// 基準ディレクトリ配下のファイル木からアーカイブを生成する
+    ///
+    /// `path_matcher` を通すのは本番と同じ経路（ソート済みエントリ）を再現するため。
     fn build_from(base_path: &std::path::Path, patterns: &[&str]) -> BuiltArchive {
         let patterns: std::vec::Vec<String> = patterns.iter().map(|p| p.to_string()).collect();
         let entries = crate::path_matcher::resolve_paths(&patterns, base_path)
@@ -658,7 +660,11 @@ mod tests {
         std::fs::read(archive.temp_file.path()).expect("アーカイブの読み出しに失敗しました")
     }
 
-    /// tar ストリームを展開せずヘッダだけ読む（正規化の確認用）
+    /// tar ストリームを展開せずヘッダだけ読む
+    ///
+    /// 正規化の確認は「展開結果」ではなく「ヘッダに書かれた値」を見る必要がある。
+    /// 展開後のファイル属性は復元時刻や umask に左右されるが、決定論性を左右するのは
+    /// あくまでアーカイブの中身であるため。
     fn read_headers(archive: &BuiltArchive) -> std::vec::Vec<tar::Header> {
         let file = std::fs::File::open(archive.temp_file.path()).unwrap();
         let decoder = zstd::Decoder::new(std::io::BufReader::new(file)).unwrap();
@@ -675,18 +681,20 @@ mod tests {
 
         #[test]
         fn test_same_input_produces_identical_bytes() {
-            // Arrange
+            // Arrange: ディレクトリとファイルを混ぜた木（ヘッダ種別が 2 種類出る）
             let temp_dir = tempfile::tempdir().unwrap();
             let base_path = temp_dir.path();
             std::fs::create_dir_all(base_path.join("dir")).unwrap();
             std::fs::write(base_path.join("dir/a.txt"), "content-a").unwrap();
             std::fs::write(base_path.join("b.txt"), "content-b").unwrap();
 
-            // Act
+            // Act: 同じ入力から 2 回生成する
             let first = build_from(base_path, &["dir", "b.txt"]);
             let second = build_from(base_path, &["dir", "b.txt"]);
 
-            // Assert
+            // Assert: バイト列まで一致すること。ハッシュだけの比較では
+            // tar ヘッダに実行時刻が混ざる退行を取り逃す（ハッシュ対象外の
+            // フィールドがあれば気づけない）ため、生バイトも比べる
             assert_eq!(read_archive_bytes(&first), read_archive_bytes(&second));
             assert_eq!(first.content_sha256, second.content_sha256);
             assert_eq!(first.object_sha256, second.object_sha256);
@@ -694,25 +702,29 @@ mod tests {
 
         #[test]
         fn test_mtime_change_does_not_change_archive() {
-            // Arrange
+            // Arrange: CI は毎回 fresh checkout するためソースの mtime が実行ごとに変わる。
+            // それでも再アップロードが起きないことがこのテストの主題
             let temp_dir = tempfile::tempdir().unwrap();
             let base_path = temp_dir.path();
             std::fs::write(base_path.join("a.txt"), "content").unwrap();
             let before = build_from(base_path, &["a.txt"]);
 
-            // Act: 内容は変えず mtime だけを更新する
+            // Act: 同じ内容を書き直して mtime だけを進める
+            // （sleep は mtime の解像度でタイムスタンプが同値になるのを避けるため）
             std::thread::sleep(std::time::Duration::from_millis(10));
             std::fs::write(base_path.join("a.txt"), "content").unwrap();
             let after = build_from(base_path, &["a.txt"]);
 
-            // Assert
+            // Assert: ヘッダの mtime を epoch 固定にしている効果。ここが崩れると
+            // アップロード抑止の仕組みそのものが機能しなくなる
             assert_eq!(read_archive_bytes(&before), read_archive_bytes(&after));
             assert_eq!(before.content_sha256, after.content_sha256);
         }
 
         #[test]
         fn test_entry_order_does_not_change_archive() {
-            // Arrange
+            // Arrange: path_matcher はソート済みを返すので、意図的に逆順の入力を作る。
+            // path_matcher を経由しない呼び出しでも決定論性が保たれるかを見たい
             let temp_dir = tempfile::tempdir().unwrap();
             let base_path = temp_dir.path();
             std::fs::write(base_path.join("a.txt"), "content-a").unwrap();
@@ -722,27 +734,30 @@ mod tests {
             let mut reversed_entries = entries.clone();
             reversed_entries.reverse();
 
-            // Act: create_archive は入力順序に依存しない契約
+            // Act
             let forward = create_archive(&entries, base_path).unwrap();
             let reversed = create_archive(&reversed_entries, base_path).unwrap();
 
-            // Assert
+            // Assert: create_archive 自身が常にソートし直す契約（HashCalculator と同じ方針）。
+            // 呼び出し側のソート漏れに決定論性を依存させない
             assert_eq!(read_archive_bytes(&forward), read_archive_bytes(&reversed));
         }
 
         #[test]
         fn test_content_change_changes_hashes() {
-            // Arrange
+            // Arrange: 上の 2 つは「変わらないこと」を見ているので、
+            // 正規化しすぎて内容の違いまで潰していないことを対で確認する
             let temp_dir = tempfile::tempdir().unwrap();
             let base_path = temp_dir.path();
             std::fs::write(base_path.join("a.txt"), "content-a").unwrap();
             let before = build_from(base_path, &["a.txt"]);
 
-            // Act
+            // Act: 中身を書き換える
             std::fs::write(base_path.join("a.txt"), "content-modified").unwrap();
             let after = build_from(base_path, &["a.txt"]);
 
-            // Assert
+            // Assert: 2 本のハッシュがどちらも変わる。content 側が変わらなければ
+            // 内容が変わってもアップロードが省略されてしまう
             assert_ne!(before.content_sha256, after.content_sha256);
             assert_ne!(before.object_sha256, after.object_sha256);
         }
@@ -757,7 +772,9 @@ mod tests {
             // Act
             let archive = build_from(base_path, &["a.txt"]);
 
-            // Assert
+            // Assert: この値は S3 metadata の cafce-content-sha256 としてそのまま入る。
+            // cache_metadata 側は小文字 16 進 64 文字のみを受け付けるため、
+            // 大文字混じりや長さ違いになると restore が MalformedContentHash で落ちる
             assert_eq!(archive.content_sha256.len(), 64);
             assert!(archive
                 .content_sha256
@@ -773,12 +790,15 @@ mod tests {
             std::fs::write(base_path.join("a.txt"), "content").unwrap();
             let archive = build_from(base_path, &["a.txt"]);
 
-            // Act: 一時ファイルを読み直して独立に SHA-256 を計算する
+            // Act: 書き込みと同時に計算した値ではなく、一時ファイルを読み直して独立に求める
             use sha2::Digest as _;
             let bytes = read_archive_bytes(&archive);
             let recomputed: [u8; 32] = sha2::Sha256::digest(&bytes).into();
 
-            // Assert
+            // Assert: object_sha256 は S3 へ x-amz-checksum-sha256 として送る値であり、
+            // 実際に送られるバイト列（= 一時ファイルの中身）と食い違えばサーバに
+            // BadDigest で拒否される。HashingWriter が部分書き込みを取りこぼしていない
+            // ことの確認も兼ねる
             assert_eq!(archive.object_sha256, recomputed);
             assert_eq!(archive.size, bytes.len() as u64);
         }
@@ -789,7 +809,7 @@ mod tests {
 
         #[test]
         fn test_mtime_uid_gid_are_zeroed() {
-            // Arrange
+            // Arrange: ディレクトリとファイルの両方のヘッダを対象にする
             let temp_dir = tempfile::tempdir().unwrap();
             let base_path = temp_dir.path();
             std::fs::create_dir_all(base_path.join("dir")).unwrap();
@@ -799,7 +819,9 @@ mod tests {
             // Act
             let headers = read_headers(&archive);
 
-            // Assert
+            // Assert: 全エントリで実行環境依存の値がゼロに潰れていること。
+            // uid/gid/uname は「誰が CI を回したか」で変わり、mtime は「いつ回したか」で変わる。
+            // 1 つでも残るとホスト間・実行間でハッシュが割れる
             assert!(!headers.is_empty());
             for header in &headers {
                 assert_eq!(header.mtime().unwrap(), 0);
@@ -814,14 +836,15 @@ mod tests {
         #[cfg(unix)]
         #[test]
         fn test_permissions_are_rounded() {
-            // Arrange
+            // Arrange: 実行ビットの有無だけで 2 値に丸める仕様の確認。
+            // 0o640 / 0o700 のような中途半端な mode を与え、丸めた結果が
+            // 0o644 / 0o755 になることを見る
             use std::os::unix::fs::PermissionsExt as _;
             let temp_dir = tempfile::tempdir().unwrap();
             let base_path = temp_dir.path();
             std::fs::create_dir_all(base_path.join("dir")).unwrap();
             std::fs::write(base_path.join("dir/plain.txt"), "content").unwrap();
             std::fs::write(base_path.join("dir/exec.sh"), "#!/bin/sh\n").unwrap();
-            // umask 差を模して中途半端な mode を付ける
             std::fs::set_permissions(
                 base_path.join("dir/plain.txt"),
                 std::fs::Permissions::from_mode(0o640),
@@ -845,7 +868,8 @@ mod tests {
                     .unwrap()
             };
 
-            // Assert
+            // Assert: 実行ビットは保つ（ビルド成果物のバイナリが復元後に実行できなくなると困る）。
+            // ディレクトリは中身を辿れるよう常に 0o755
             assert_eq!(mode_of("dir"), MODE_EXECUTABLE);
             assert_eq!(mode_of("dir/plain.txt"), MODE_REGULAR);
             assert_eq!(mode_of("dir/exec.sh"), MODE_EXECUTABLE);
@@ -854,7 +878,8 @@ mod tests {
         #[cfg(unix)]
         #[test]
         fn test_umask_difference_does_not_change_archive() {
-            // Arrange: 同じ内容・同じ実行ビットで mode だけ違うファイルを 2 つ用意する
+            // Arrange: umask の違う 2 台のランナーを模す。同じ内容・同じ実行ビット（どちらも
+            // 実行不可）で、group/other のビットだけが違うファイルを別ディレクトリに置く
             use std::os::unix::fs::PermissionsExt as _;
             let temp_dir = tempfile::tempdir().unwrap();
             let first_base = temp_dir.path().join("first");
@@ -878,13 +903,14 @@ mod tests {
             let first = build_from(&first_base, &["a.txt"]);
             let second = build_from(&second_base, &["a.txt"]);
 
-            // Assert
+            // Assert: 丸めが効いていれば同じハッシュになる。効いていないと、
+            // umask の違うランナー間でキャッシュを共有するたびに再アップロードが走る
             assert_eq!(first.content_sha256, second.content_sha256);
         }
 
         #[test]
         fn test_paths_use_slash_separator() {
-            // Arrange
+            // Arrange: 2 段ネストしたディレクトリ
             let temp_dir = tempfile::tempdir().unwrap();
             let base_path = temp_dir.path();
             std::fs::create_dir_all(base_path.join("a/b")).unwrap();
@@ -898,7 +924,9 @@ mod tests {
                 .map(|h| h.path().unwrap().to_string_lossy().into_owned())
                 .collect();
 
-            // Assert
+            // Assert: ヘッダに書かれた名前が `/` 区切りの相対パスで、浅い順に並ぶこと。
+            // Windows で `a\b\c.txt` と書かれると同じ内容でもバイト列が割れるうえ、
+            // Unix 側で展開したときに 1 つの妙な名前のファイルになる
             assert_eq!(paths, vec!["a", "a/b", "a/b/c.txt"]);
         }
     }
@@ -908,7 +936,8 @@ mod tests {
 
         #[test]
         fn test_roundtrip_restores_file_contents() {
-            // Arrange
+            // Arrange: 生成元と展開先を別ディレクトリにして、
+            // 「たまたま元の木が残っていた」ことで通ってしまう事故を避ける
             let source_dir = tempfile::tempdir().unwrap();
             let source_path = source_dir.path();
             std::fs::create_dir_all(source_path.join("nested/deep")).unwrap();
@@ -921,7 +950,9 @@ mod tests {
             let content_sha256 =
                 extract_archive(archive.temp_file.path(), dest_dir.path()).unwrap();
 
-            // Assert
+            // Assert: 展開側が返すハッシュが生成側と一致すること。この 2 つは別経路
+            // （書き込み時 / 読み出し時）で計算しているので、片方だけ tar ストリームの
+            // 範囲を取り違えていると一致しない。restore の内容検証はこの一致に依存している
             assert_eq!(content_sha256, archive.content_sha256);
             assert_eq!(
                 std::fs::read_to_string(dest_dir.path().join("top.txt")).unwrap(),
@@ -935,7 +966,7 @@ mod tests {
 
         #[test]
         fn test_roundtrip_restores_empty_directory() {
-            // Arrange
+            // Arrange: 中身の無いディレクトリだけを含むアーカイブ
             let source_dir = tempfile::tempdir().unwrap();
             std::fs::create_dir_all(source_dir.path().join("empty")).unwrap();
             let archive = build_from(source_dir.path(), &["empty"]);
@@ -944,7 +975,8 @@ mod tests {
             // Act
             extract_archive(archive.temp_file.path(), dest_dir.path()).unwrap();
 
-            // Assert
+            // Assert: ファイルの親としてしかディレクトリを作らない実装だと、
+            // 中身の無いディレクトリは復元されず消えてしまう
             assert!(dest_dir.path().join("empty").is_dir());
         }
 
@@ -968,7 +1000,8 @@ mod tests {
             // Act
             extract_archive(archive.temp_file.path(), dest_dir.path()).unwrap();
 
-            // Assert
+            // Assert: ヘッダの mode を展開時に適用できているか。ここが漏れると
+            // 復元したバイナリが実行できず、キャッシュがヒットしてもビルドが失敗する
             let exec_mode = std::fs::metadata(dest_dir.path().join("exec.sh"))
                 .unwrap()
                 .permissions()
@@ -986,7 +1019,7 @@ mod tests {
         #[cfg(unix)]
         #[test]
         fn test_roundtrip_restores_symlink_as_link() {
-            // Arrange
+            // Arrange: ファイルへの相対リンク
             let source_dir = tempfile::tempdir().unwrap();
             let source_path = source_dir.path();
             std::fs::write(source_path.join("real.txt"), "content").unwrap();
@@ -997,7 +1030,8 @@ mod tests {
             // Act
             extract_archive(archive.temp_file.path(), dest_dir.path()).unwrap();
 
-            // Assert
+            // Assert: 実体をコピーした通常ファイルではなくリンクとして復元されること。
+            // リンク先の文字列も元のまま（絶対パスへ書き換わっていない）であること
             let restored_link = dest_dir.path().join("link.txt");
             assert!(std::fs::symlink_metadata(&restored_link)
                 .unwrap()
@@ -1120,7 +1154,8 @@ mod tests {
 
         #[test]
         fn test_extraction_overwrites_existing_file() {
-            // Arrange
+            // Arrange: 既存ファイルをアーカイブ内より**長く**しておく。
+            // 追記や部分上書きになっていると古い末尾が残り、それを検出できる
             let source_dir = tempfile::tempdir().unwrap();
             std::fs::write(source_dir.path().join("a.txt"), "new-content").unwrap();
             let archive = build_from(source_dir.path(), &["a.txt"]);
@@ -1134,7 +1169,8 @@ mod tests {
             // Act
             extract_archive(archive.temp_file.path(), dest_dir.path()).unwrap();
 
-            // Assert
+            // Assert: 既存を残すのではなく truncate して上書きする。キャッシュ復元では
+            // 古いものが中途半端に残る方が事故になりやすいという判断（設計doc 6.4）
             assert_eq!(
                 std::fs::read_to_string(dest_dir.path().join("a.txt")).unwrap(),
                 "new-content"
@@ -1143,7 +1179,9 @@ mod tests {
 
         #[test]
         fn test_extraction_sets_mtime_to_now() {
-            // Arrange: アーカイブ内の mtime は epoch 固定だが、展開後は展開時刻になる（設計doc 6.5）
+            // Arrange: アーカイブ内の mtime は epoch 固定。そのまま復元すると成果物が
+            // ソースより古く見え、cargo や make が全再ビルドしてキャッシュの意味が消える。
+            // そのため展開時刻を入れる（設計doc 6.5）
             let source_dir = tempfile::tempdir().unwrap();
             std::fs::write(source_dir.path().join("a.txt"), "content").unwrap();
             let archive = build_from(source_dir.path(), &["a.txt"]);
@@ -1153,7 +1191,9 @@ mod tests {
             // Act
             extract_archive(archive.temp_file.path(), dest_dir.path()).unwrap();
 
-            // Assert
+            // Assert: epoch のままなら 1970 年になるので大きく下回る。
+            // 5 秒の許容はファイルシステムの時刻解像度とテスト実行時間のぶれを吸収するためで、
+            // 「epoch ではない」ことを見るには十分な粗さ
             let mtime = std::fs::metadata(dest_dir.path().join("a.txt"))
                 .unwrap()
                 .modified()
@@ -1169,6 +1209,10 @@ mod tests {
         use super::*;
 
         /// 細工済み tar（zstd 圧縮済み）を組み立てる
+        ///
+        /// tar の中身は S3 から降ってくる外部入力であり、cafce 自身が書いたとは限らない。
+        /// `create_archive` は正常なアーカイブしか作れないので、攻撃者が置いた
+        /// オブジェクトを模すには tar を手で組む必要がある。
         fn build_malicious_archive<F>(configure: F) -> tempfile::NamedTempFile
         where
             F: FnOnce(&mut tar::Builder<zstd::Encoder<'static, std::fs::File>>),
@@ -1194,7 +1238,9 @@ mod tests {
             header.set_mtime(0);
             header.set_uid(0);
             header.set_gid(0);
-            // set_path は `..` を弾かないため、GNU longname 経路を通さずに直接名前を書く
+            // `Header::set_path` は長い名前を GNU longname エントリへ回すなどの加工を行う。
+            // ここでは「攻撃者が書いたそのままのバイト列」を再現したいので、
+            // GNU ヘッダの name フィールドへ直接書き込む
             header
                 .as_gnu_mut()
                 .expect("new_gnu なので GNU ヘッダのはず")
@@ -1206,7 +1252,7 @@ mod tests {
 
         #[test]
         fn test_parent_dir_entry_is_rejected() {
-            // Arrange
+            // Arrange: 展開先の 1 階層上へ書き込もうとするエントリ（いわゆる zip-slip）
             let archive = build_malicious_archive(|builder| {
                 append_raw_entry(builder, "../evil.txt", b"pwned");
             });
@@ -1215,7 +1261,8 @@ mod tests {
             // Act
             let result = extract_archive(archive.path(), dest_dir.path());
 
-            // Assert
+            // Assert: スキップではなくエラーにする。CI では作業ディレクトリの親に
+            // 他ジョブの成果物や設定が置かれていることがあり、黙って書かれると気づけない
             assert!(result
                 .unwrap_err()
                 .to_string()
@@ -1224,7 +1271,8 @@ mod tests {
 
         #[test]
         fn test_nested_parent_dir_entry_is_rejected() {
-            // Arrange
+            // Arrange: いったん潜ってから `..` を重ねて抜け出す形。単純に先頭が `..` か
+            // どうかだけを見る実装だとこれを通してしまう
             let archive = build_malicious_archive(|builder| {
                 append_raw_entry(builder, "a/b/../../../evil.txt", b"pwned");
             });
@@ -1233,7 +1281,7 @@ mod tests {
             // Act
             let result = extract_archive(archive.path(), dest_dir.path());
 
-            // Assert
+            // Assert: 畳んだ結果で判定しているので検出できる
             assert!(result
                 .unwrap_err()
                 .to_string()
@@ -1242,7 +1290,8 @@ mod tests {
 
         #[test]
         fn test_absolute_path_entry_is_rejected() {
-            // Arrange
+            // Arrange: 絶対パスのエントリ。`base.join("/etc/evil.txt")` は Rust では
+            // `/etc/evil.txt` になり、展開先を完全に無視して書き込まれてしまう
             let archive = build_malicious_archive(|builder| {
                 append_raw_entry(builder, "/etc/evil.txt", b"pwned");
             });
@@ -1251,7 +1300,7 @@ mod tests {
             // Act
             let result = extract_archive(archive.path(), dest_dir.path());
 
-            // Assert
+            // Assert: join する前に絶対パスを弾く
             assert!(result
                 .unwrap_err()
                 .to_string()
@@ -1260,7 +1309,9 @@ mod tests {
 
         #[test]
         fn test_symlink_escaping_base_is_rejected() {
-            // Arrange
+            // Arrange: エントリ名自体は展開先の中（`escape.txt`）だが、リンク先が外を指す。
+            // 作成そのものは害が無く見えるが、後続の書き込みがリンク経由で
+            // 展開先の外へ届く経路になる
             let archive = build_malicious_archive(|builder| {
                 let mut header = tar::Header::new_gnu();
                 header.set_entry_type(tar::EntryType::Symlink);
@@ -1278,7 +1329,7 @@ mod tests {
             // Act
             let result = extract_archive(archive.path(), dest_dir.path());
 
-            // Assert
+            // Assert: エントリ名だけでなくリンク先も検証している
             assert!(result
                 .unwrap_err()
                 .to_string()
@@ -1287,7 +1338,8 @@ mod tests {
 
         #[test]
         fn test_absolute_symlink_target_is_rejected() {
-            // Arrange
+            // Arrange: リンク先が絶対パスの場合。相対リンクと違い `..` を数えても
+            // 検出できないので、判定を分けている
             let archive = build_malicious_archive(|builder| {
                 let mut header = tar::Header::new_gnu();
                 header.set_entry_type(tar::EntryType::Symlink);
@@ -1314,7 +1366,9 @@ mod tests {
 
         #[test]
         fn test_relative_symlink_inside_base_is_allowed() {
-            // Arrange: 基準ディレクトリ内で完結するリンクは拒否しない
+            // Arrange: `sub/link.txt -> ../real.txt` は `..` を含むが、リンクが置かれる
+            // `sub/` を基準に解決すると展開先直下に収まる。正当なアーカイブにも普通に現れる形で、
+            // 「リンク先に `..` があれば拒否」という雑な実装だと誤検知する
             let archive = build_malicious_archive(|builder| {
                 let mut header = tar::Header::new_gnu();
                 header.set_entry_type(tar::EntryType::Symlink);
@@ -1332,7 +1386,7 @@ mod tests {
             // Act
             let result = extract_archive(archive.path(), dest_dir.path());
 
-            // Assert
+            // Assert: 拒否されない（リンク先が存在しない dangling リンクでも作成は成功する）
             assert!(result.is_ok());
         }
     }
@@ -1342,27 +1396,28 @@ mod tests {
 
         #[test]
         fn test_normal_relative_path() {
-            // Arrange
+            // Arrange: 何の細工もない普通のエントリ名
             let base_path = std::path::Path::new("/base");
             let entry_path = std::path::Path::new("dir/file.txt");
 
             // Act
             let result = resolve_entry_destination(entry_path, base_path).unwrap();
 
-            // Assert
+            // Assert: 展開先の絶対パスへ素直に解決される（正常系を潰していないことの確認）
             assert_eq!(result, Some(std::path::PathBuf::from("/base/dir/file.txt")));
         }
 
         #[test]
         fn test_cur_dir_entry_maps_to_base_itself() {
-            // Arrange
+            // Arrange: `tar cf` で作ったアーカイブには先頭に `./` エントリが入ることがある
             let base_path = std::path::Path::new("/base");
             let entry_path = std::path::Path::new("./");
 
             // Act
             let result = resolve_entry_destination(entry_path, base_path).unwrap();
 
-            // Assert: 作成対象が無いので None
+            // Assert: 展開先そのものを指すので作成対象は無い。エラーにすると
+            // 他のツールが作った正当なアーカイブを展開できなくなるため `None` で読み飛ばす
             assert_eq!(result, None);
         }
 
@@ -1400,14 +1455,17 @@ mod tests {
 
         #[test]
         fn test_parent_dir_returning_inside_is_allowed() {
-            // Arrange: 途中で `..` を通っても最終的に基準内なら許可する
+            // Arrange: 途中で `..` を通るが最終的に展開先へ戻るエントリ
             let base_path = std::path::Path::new("/base");
             let entry_path = std::path::Path::new("dir/../file.txt");
 
             // Act
             let result = resolve_entry_destination(entry_path, base_path).unwrap();
 
-            // Assert
+            // Assert: 展開側は `..` の有無ではなく畳んだ結果で判定する。
+            // `paths`（store 側）が `..` を含むパターンを一律拒否するのとは方針が違う。
+            // あちらは利用者が書き直せる設定値、こちらは他ツールが作ったアーカイブも
+            // 受け入れる必要がある外部入力、という差である
             assert_eq!(result, Some(std::path::PathBuf::from("/base/file.txt")));
         }
     }

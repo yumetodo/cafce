@@ -177,73 +177,88 @@ mod tests {
 
         #[test]
         fn test_no_such_key_is_miss() {
-            // Arrange
+            // Arrange: AWS S3 が GetObject で返す典型的な cache miss
             let status = Some(404);
             let error_code = Some("NoSuchKey");
 
             // Act
             let miss = is_cache_miss(status, error_code);
 
-            // Assert
+            // Assert: miss なら次のキー候補へ進む
             assert!(miss);
         }
 
         #[test]
         fn test_bare_404_is_miss() {
-            // Arrange: NoSuchKey を返さない S3 互換サーバを想定する
+            // Arrange: NoSuchKey を返さない S3 互換サーバを想定する。
+            // 設計doc 6.9 は NoSuchKey しか挙げていなかったが、コードに依存しない
+            // 404 判定も併せ持たせた
             let status = Some(404);
             let error_code = Some("NotFound");
 
             // Act
             let miss = is_cache_miss(status, error_code);
 
-            // Assert
+            // Assert: ここを取りこぼすと、キャッシュが無いだけで restore がエラー終了し
+            // CI が落ちる（本来は false を返して full build へ進めばよい）
             assert!(miss);
         }
 
         #[test]
         fn test_access_denied_is_not_miss() {
-            // Arrange: silent な auth failure を恒常的な cache miss に見せかけない
+            // Arrange: 権限不足。AWS S3 では s3:ListBucket が無いと、存在しないキーへの
+            // アクセスが 404 ではなく 403 で返ることがある
             let status = Some(403);
             let error_code = Some("AccessDenied");
 
             // Act
             let miss = is_cache_miss(status, error_code);
 
-            // Assert
+            // Assert: miss として扱うと、権限設定を間違えている間ずっと
+            // 「キャッシュが無い」ように見え、毎回フルビルドしていることに誰も気づかない。
+            // probe と同じくフェイルファストにする
             assert!(!miss);
         }
 
         #[test]
         fn test_server_error_is_not_miss() {
-            // Arrange
+            // Arrange: サーバ側の一時障害
             let status = Some(500);
             let error_code = Some("InternalError");
 
             // Act
             let miss = is_cache_miss(status, error_code);
 
-            // Assert
+            // Assert: 「無い」と「取れなかった」を混ぜない。混ぜると障害中に
+            // 全キー候補を miss と判定して、あるはずのキャッシュを捨ててしまう
             assert!(!miss);
         }
 
         #[test]
         fn test_network_error_without_response_is_not_miss() {
-            // Arrange: 接続失敗・タイムアウト
+            // Arrange: HTTP レスポンスに到達しなかった場合（接続失敗・タイムアウト）
             let status: Option<u16> = None;
             let error_code: Option<&str> = None;
 
             // Act
             let miss = is_cache_miss(status, error_code);
 
-            // Assert
+            // Assert: 情報が無いときは miss と決めつけない（既定で安全側）
             assert!(!miss);
         }
     }
 
-    /// キー候補の順序試行そのものは S3 を介さずに確認できるため、
-    /// `get_object` の結果をスクリプト化して分岐を網羅する
+    /// キー候補の順序試行の分岐を、S3 を介さずに確認する
+    ///
+    /// `restore` 本体は `get_object` と展開処理に密結合しているため、そのままでは
+    /// S3 無しに呼べない。ここでは「候補を順に試し、最初のヒットで打ち切り、
+    /// エラーなら即座に伝播する」という**ループの形**だけを同じ構造で書き写し、
+    /// 分岐を網羅する（`probe` の同種のテストと同じ手法）。
+    /// 本体との同期はコードレビューで担保し、実際の疎通は統合テストで確認する。
     mod key_candidate_iteration_tests {
+        /// `get_object` の結果を先に用意しておき、ヒットしたキーを返す
+        ///
+        /// `Ok(true)` = ヒット、`Ok(false)` = miss、`Err` = 403 等の異常。
         fn restore_with_scripted_results(
             keys: &[String],
             results: std::vec::Vec<anyhow::Result<bool>>,
@@ -262,20 +277,22 @@ mod tests {
 
         #[test]
         fn test_primary_hit_does_not_try_fallback() {
-            // Arrange
+            // Arrange: 候補は 2 つあるが結果は 1 つしか用意しない。
+            // fallback まで試そうとすれば結果が尽きて None になり、検出できる
             let keys = vec!["primary".to_string(), "fallback".to_string()];
             let results = vec![Ok(true)];
 
             // Act
             let hit = restore_with_scripted_results(&keys, results).unwrap();
 
-            // Assert
+            // Assert: primary で打ち切る。余分な GetObject を打たないこと
             assert_eq!(hit.as_deref(), Some("primary"));
         }
 
         #[test]
         fn test_primary_miss_fallback_hit() {
-            // Arrange
+            // Arrange: feature ブランチのキーが無く、main のキャッシュへ落ちる典型ケース。
+            // fallback2 まで試さないことを見るため結果は 2 つしか用意しない
             let keys = vec![
                 "primary".to_string(),
                 "fallback1".to_string(),
@@ -286,33 +303,37 @@ mod tests {
             // Act
             let hit = restore_with_scripted_results(&keys, results).unwrap();
 
-            // Assert: 最初にヒットした候補で打ち切る
+            // Assert: 最も近い（先に書かれた）候補が選ばれる。順序が入れ替わると
+            // 意図より古いキャッシュを引いてしまう
             assert_eq!(hit.as_deref(), Some("fallback1"));
         }
 
         #[test]
         fn test_all_miss_returns_none() {
-            // Arrange
+            // Arrange: 全候補が miss
             let keys = vec!["primary".to_string(), "fallback".to_string()];
             let results = vec![Ok(false), Ok(false)];
 
             // Act
             let hit = restore_with_scripted_results(&keys, results).unwrap();
 
-            // Assert
+            // Assert: エラーではなく「何もしなかった」として返す。
+            // 呼び出し側は stdout に false を出して exit 0 で終わる
             assert_eq!(hit, None);
         }
 
         #[test]
         fn test_error_stops_further_tries() {
-            // Arrange: 403 で後続候補を試さない
+            // Arrange: primary で 403。結果を 1 つしか用意していないので、
+            // 後続を試そうとすれば結果が尽きて Ok(None) になり、検出できる
             let keys = vec!["primary".to_string(), "fallback".to_string()];
             let results = vec![Err(anyhow::anyhow!("403 AccessDenied"))];
 
             // Act
             let result = restore_with_scripted_results(&keys, results);
 
-            // Assert
+            // Assert: 即座に伝播する。権限不足のまま候補を舐めても全部失敗するだけで、
+            // 最後に「全 miss」と報告すると原因が隠れる
             assert!(result.unwrap_err().to_string().contains("403"));
         }
     }

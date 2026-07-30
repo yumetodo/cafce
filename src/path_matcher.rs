@@ -253,19 +253,21 @@ mod tests {
             // Act
             let archive_path = to_archive_path(relative_path);
 
-            // Assert
+            // Assert: 単一要素では区切り文字が絡まないので素通しになる
             assert_eq!(archive_path, "foo.txt");
         }
 
         #[test]
         fn test_nested_components_joined_with_slash() {
-            // Arrange
+            // Arrange: `collect()` でプラットフォーム既定の区切り文字で組む
+            // （Windows なら `a\b\c.txt`）
             let relative_path: std::path::PathBuf = ["a", "b", "c.txt"].iter().collect();
 
             // Act
             let archive_path = to_archive_path(&relative_path);
 
-            // Assert: プラットフォームの区切り文字によらず `/` になる
+            // Assert: tar のエントリ名は常に `/` 区切り。ここが OS 依存になると
+            // 同じ内容でもアーカイブのバイト列が割れ、決定論性が崩れる
             assert_eq!(archive_path, "a/b/c.txt");
         }
     }
@@ -275,37 +277,40 @@ mod tests {
 
         #[test]
         fn test_removes_cur_dir() {
-            // Arrange
+            // Arrange: glob の結果には `./` が混ざりうる
             let path = std::path::Path::new("/base/./foo");
 
             // Act
             let normalized = normalize_lexically(path);
 
-            // Assert
+            // Assert: `.` は取り除く。残っていると strip_prefix での相対化に失敗する
             assert_eq!(normalized, std::path::Path::new("/base/foo"));
         }
 
         #[test]
         fn test_resolves_parent_dir() {
-            // Arrange
+            // Arrange: 途中で親へ戻るが最終的には基準内に収まるパス
             let path = std::path::Path::new("/base/sub/../foo");
 
             // Act
             let normalized = normalize_lexically(path);
 
-            // Assert
+            // Assert: `..` は直前の要素を打ち消す
             assert_eq!(normalized, std::path::Path::new("/base/foo"));
         }
 
         #[test]
         fn test_parent_dir_can_escape_base() {
-            // Arrange: 字句比較だけでは検出できない脱出パターン
+            // Arrange: この関数が存在する理由そのものの入力。
+            // `Path::new("/base/../etc/passwd").starts_with("/base")` は
+            // components 単位の字句比較なので **true** を返してしまう
             let path = std::path::Path::new("/base/../etc/passwd");
 
             // Act
             let normalized = normalize_lexically(path);
 
-            // Assert
+            // Assert: 畳んだ結果は `/base` 配下ではないと分かる形になる。
+            // これを starts_with に掛けることで初めて脱出を検出できる
             assert_eq!(normalized, std::path::Path::new("/etc/passwd"));
         }
     }
@@ -315,7 +320,7 @@ mod tests {
 
         #[test]
         fn test_single_file() {
-            // Arrange
+            // Arrange: ワイルドカードを含まない、ファイル名そのままのパターン
             let temp_dir = tempfile::tempdir().unwrap();
             let base_path = temp_dir.path();
             std::fs::write(base_path.join("foo.txt"), "content").unwrap();
@@ -324,14 +329,17 @@ mod tests {
             // Act
             let entries = resolve_paths(&patterns, base_path).unwrap();
 
-            // Assert
+            // Assert: 結果は基準ディレクトリからの相対パスであること（絶対パスが漏れないこと）と、
+            // 種別が File として判定されることを固定する
             assert_eq!(archive_paths(&entries), vec!["foo.txt"]);
             assert_eq!(kind_of(&entries, "foo.txt"), &EntryKind::File);
         }
 
         #[test]
         fn test_directory_is_expanded_recursively() {
-            // Arrange
+            // Arrange: ディレクトリ名だけを 1 つ指定する（GitLab CI の cache:paths と同じ書き方）。
+            // ドットファイルも入れているのは、glob の `*` では拾えないものが
+            // walkdir 経由なら入ることを確認するため
             let temp_dir = tempfile::tempdir().unwrap();
             let base_path = temp_dir.path();
             std::fs::create_dir_all(base_path.join("target/debug")).unwrap();
@@ -342,7 +350,9 @@ mod tests {
             // Act
             let entries = resolve_paths(&patterns, base_path).unwrap();
 
-            // Assert: ディレクトリエントリ自体も含む
+            // Assert: 配下のファイルだけでなく `target` / `target/debug` という
+            // ディレクトリエントリ自体も含む（FileMatcher はここを除外する）。
+            // 並びはバイト列昇順なので `.rustc_info.json` が `debug` より先に来る
             assert_eq!(
                 archive_paths(&entries),
                 vec![
@@ -359,7 +369,7 @@ mod tests {
 
         #[test]
         fn test_empty_directory_is_preserved() {
-            // Arrange: 空ディレクトリも構造として保存する（FileMatcher との差分）
+            // Arrange: 中身が無いディレクトリだけを指定する
             let temp_dir = tempfile::tempdir().unwrap();
             let base_path = temp_dir.path();
             std::fs::create_dir_all(base_path.join("empty")).unwrap();
@@ -368,14 +378,16 @@ mod tests {
             // Act
             let entries = resolve_paths(&patterns, base_path).unwrap();
 
-            // Assert
+            // Assert: 0 件ではなくディレクトリエントリ 1 件になる。ファイルだけを集める実装だと
+            // ここが空になり、復元時にディレクトリが失われる（ビルドツールが
+            // 空の出力ディレクトリの存在を前提にしていると壊れる）
             assert_eq!(archive_paths(&entries), vec!["empty"]);
             assert_eq!(kind_of(&entries, "empty"), &EntryKind::Directory);
         }
 
         #[test]
         fn test_wildcard_pattern() {
-            // Arrange
+            // Arrange: マッチしない `c.md` を混ぜて、パターンが絞り込みとして効くことを見る
             let temp_dir = tempfile::tempdir().unwrap();
             let base_path = temp_dir.path();
             std::fs::write(base_path.join("a.txt"), "a").unwrap();
@@ -386,13 +398,13 @@ mod tests {
             // Act
             let entries = resolve_paths(&patterns, base_path).unwrap();
 
-            // Assert
+            // Assert: `.txt` の 2 件だけが入る
             assert_eq!(archive_paths(&entries), vec!["a.txt", "b.txt"]);
         }
 
         #[test]
         fn test_recursive_wildcard_pattern() {
-            // Arrange
+            // Arrange: `**` が複数階層をまたぐこと（`nested/deep` の 2 段下）を確認する
             let temp_dir = tempfile::tempdir().unwrap();
             let base_path = temp_dir.path();
             std::fs::create_dir_all(base_path.join("nested/deep")).unwrap();
@@ -402,13 +414,14 @@ mod tests {
             // Act
             let entries = resolve_paths(&patterns, base_path).unwrap();
 
-            // Assert
+            // Assert: ファイルにマッチした場合は途中のディレクトリを含めない
+            // （ディレクトリ指定のときだけ再帰展開する、という切り分け）
             assert_eq!(archive_paths(&entries), vec!["nested/deep/x.lock"]);
         }
 
         #[test]
         fn test_duplicates_are_deduplicated() {
-            // Arrange: 同じファイルに複数パターンがマッチする
+            // Arrange: 3 つのパターンが全て同じ 1 ファイルにマッチする
             let temp_dir = tempfile::tempdir().unwrap();
             let base_path = temp_dir.path();
             std::fs::write(base_path.join("foo.txt"), "content").unwrap();
@@ -421,13 +434,15 @@ mod tests {
             // Act
             let entries = resolve_paths(&patterns, base_path).unwrap();
 
-            // Assert
+            // Assert: 3 件ではなく 1 件。重複したまま tar へ渡すと同じパスのエントリが
+            // 複数書かれ、アーカイブサイズも内容ハッシュもパターンの書き方に左右される
             assert_eq!(archive_paths(&entries), vec!["foo.txt"]);
         }
 
         #[test]
         fn test_result_is_sorted_regardless_of_pattern_order() {
-            // Arrange
+            // Arrange: 作成順もパターンの並びも昇順ではない状態を作る。
+            // ファイルシステムの列挙順は環境依存なので、そこに引きずられないことを見たい
             let temp_dir = tempfile::tempdir().unwrap();
             let base_path = temp_dir.path();
             for name in ["c.txt", "a.txt", "b.txt"] {
@@ -444,38 +459,44 @@ mod tests {
                 "a.txt".to_string(),
             ];
 
-            // Act
+            // Act: パターンの並びだけを逆にして 2 回解決する
             let forward = resolve_paths(&patterns_forward, base_path).unwrap();
             let reversed = resolve_paths(&patterns_reversed, base_path).unwrap();
 
-            // Assert
+            // Assert: 常にバイト列昇順で、かつ入力順に依存しない。
+            // ここが崩れると同じ内容から違うアーカイブが生まれ、
+            // 無駄な再アップロードが起きる（決定論性の前提）
             assert_eq!(archive_paths(&forward), vec!["a.txt", "b.txt", "c.txt"]);
             assert_eq!(forward, reversed);
         }
 
         #[test]
         fn test_empty_patterns_is_error() {
-            // Arrange
+            // Arrange: config に `paths = []` と書いた（あるいは書き忘れた）状態
             let temp_dir = tempfile::tempdir().unwrap();
             let patterns: std::vec::Vec<String> = vec![];
 
             // Act
             let result = resolve_paths(&patterns, temp_dir.path());
 
-            // Assert
+            // Assert: 空アーカイブを置くと、以後の restore が「ヒットしたのに何も復元されない」
+            // 状態になり原因追跡が難しい。store の入口で落とす
             assert!(result.unwrap_err().to_string().contains("paths が空です"));
         }
 
         #[test]
         fn test_no_match_is_error() {
-            // Arrange
+            // Arrange: パターンは書かれているのに 1 件もマッチしない
+            // （設定ミス、あるいは前段のビルドが成果物を作れなかった状況）
             let temp_dir = tempfile::tempdir().unwrap();
             let patterns = vec!["does-not-exist/**".to_string()];
 
             // Act
             let result = resolve_paths(&patterns, temp_dir.path());
 
-            // Assert: キー計算の 0 件マッチ（default フォールバック）とは別扱いでエラーにする
+            // Assert: `key.files` の 0 件マッチは GitLab CI 互換のため `default` キーへ倒すが、
+            // キャッシュ本体の 0 件マッチは別の判断軸としてエラーにする。
+            // ビルド失敗を「正常な空キャッシュ」として固定してしまわないため
             assert!(result
                 .unwrap_err()
                 .to_string()
@@ -484,7 +505,7 @@ mod tests {
 
         #[test]
         fn test_absolute_pattern_is_rejected() {
-            // Arrange
+            // Arrange: 基準ディレクトリと無関係な場所を指す絶対パス
             let temp_dir = tempfile::tempdir().unwrap();
             #[cfg(not(windows))]
             let patterns = vec!["/etc/passwd".to_string()];
@@ -494,7 +515,8 @@ mod tests {
             // Act
             let result = resolve_paths(&patterns, temp_dir.path());
 
-            // Assert
+            // Assert: 許すとキャッシュに機密ファイルを吸い上げて S3 へ送れてしまう。
+            // `key.files` と同じくパターンの段階で拒否する
             assert!(result
                 .unwrap_err()
                 .to_string()
@@ -503,7 +525,8 @@ mod tests {
 
         #[test]
         fn test_parent_dir_escape_is_rejected() {
-            // Arrange
+            // Arrange: 相対パスのまま基準ディレクトリの外へ出るパターン。
+            // 実際に外側へ読まれうるファイルを置いて、拾われないことを見る
             let temp_dir = tempfile::tempdir().unwrap();
             let base_path = temp_dir.path().join("base");
             std::fs::create_dir_all(&base_path).unwrap();
@@ -513,7 +536,8 @@ mod tests {
             // Act
             let result = resolve_paths(&patterns, &base_path);
 
-            // Assert
+            // Assert: FileMatcher は基準外のマッチを黙って無視するが、
+            // paths では設定ミスに気づけるようエラーにする
             assert!(result
                 .unwrap_err()
                 .to_string()
@@ -522,7 +546,9 @@ mod tests {
 
         #[test]
         fn test_parent_dir_in_middle_is_rejected() {
-            // Arrange: 最終的には基準内へ戻るパターンも、脱出の余地を残さないため拒否する
+            // Arrange: `sub/../foo.txt` は畳めば `foo.txt` で基準内に収まる。
+            // それでも拒否するのは、`..` を一切許さない方が判定を単純に保てるためで、
+            // 利用者は `foo.txt` と書き直すだけで済む
             let temp_dir = tempfile::tempdir().unwrap();
             let base_path = temp_dir.path();
             std::fs::create_dir_all(base_path.join("sub")).unwrap();
@@ -532,7 +558,7 @@ mod tests {
             // Act
             let result = resolve_paths(&patterns, base_path);
 
-            // Assert
+            // Assert: 「結果が基準内なら通す」ではなく、パターンに `..` があれば入口で弾く
             assert!(result
                 .unwrap_err()
                 .to_string()
@@ -541,7 +567,9 @@ mod tests {
 
         #[test]
         fn test_base_path_with_glob_meta_chars() {
-            // Arrange: `[`・`]` は glob の character class メタ文字
+            // Arrange: 基準ディレクトリ名に `[`・`]`（glob の character class メタ文字）が入る。
+            // パターンではなく基準パス側にメタ文字がある場合の話で、
+            // エスケープを忘れると `build[1]` が「build のうち 1 文字」として解釈され 0 件になる
             let temp_dir = tempfile::tempdir().unwrap();
             let base_path = temp_dir.path().join("build[1]");
             std::fs::create_dir_all(&base_path).unwrap();
@@ -551,14 +579,14 @@ mod tests {
             // Act
             let entries = resolve_paths(&patterns, &base_path).unwrap();
 
-            // Assert
+            // Assert: エスケープが効いていれば普通に 1 件見つかる
             assert_eq!(archive_paths(&entries), vec!["foo.txt"]);
         }
 
         #[cfg(unix)]
         #[test]
         fn test_symlink_to_file_is_not_followed() {
-            // Arrange
+            // Arrange: リンクだけをパターンに指定する（リンク先の real.txt は指定しない）
             let temp_dir = tempfile::tempdir().unwrap();
             let base_path = temp_dir.path();
             std::fs::write(base_path.join("real.txt"), "content").unwrap();
@@ -568,7 +596,8 @@ mod tests {
             // Act
             let entries = resolve_paths(&patterns, base_path).unwrap();
 
-            // Assert: 実体ではなくリンクとして 1 件だけ入る
+            // Assert: 辿ってしまうと File として実体の中身を重複格納することになる。
+            // Symlink として入ることで、復元時もリンクのまま再現できる
             assert_eq!(archive_paths(&entries), vec!["link.txt"]);
             assert_eq!(kind_of(&entries, "link.txt"), &EntryKind::Symlink);
         }
@@ -576,7 +605,7 @@ mod tests {
         #[cfg(unix)]
         #[test]
         fn test_symlink_to_directory_is_not_traversed() {
-            // Arrange
+            // Arrange: ディレクトリへのリンク。辿ると walkdir が配下まで降りてしまう
             let temp_dir = tempfile::tempdir().unwrap();
             let base_path = temp_dir.path();
             std::fs::create_dir_all(base_path.join("real_dir")).unwrap();
@@ -587,7 +616,9 @@ mod tests {
             // Act
             let entries = resolve_paths(&patterns, base_path).unwrap();
 
-            // Assert: リンク先の配下は列挙しない
+            // Assert: `link_dir/inner.txt` は入らない。辿る実装だと、リンク先が
+            // 基準ディレクトリの外にある場合に想定外のファイルを持ち出すことになる。
+            // 判定に `is_dir()` ではなく `symlink_metadata` を使っているのがここで効く
             assert_eq!(archive_paths(&entries), vec!["link_dir"]);
             assert_eq!(kind_of(&entries, "link_dir"), &EntryKind::Symlink);
         }
@@ -595,7 +626,8 @@ mod tests {
         #[cfg(unix)]
         #[test]
         fn test_symlink_inside_directory_is_kept_as_link() {
-            // Arrange
+            // Arrange: 再帰展開の途中で出てくるリンク。上の 2 つはパターンが直接
+            // リンクを指す場合で、こちらは walkdir が見つける場合の経路
             let temp_dir = tempfile::tempdir().unwrap();
             let base_path = temp_dir.path();
             std::fs::create_dir_all(base_path.join("dir")).unwrap();
@@ -606,7 +638,7 @@ mod tests {
             // Act
             let entries = resolve_paths(&patterns, base_path).unwrap();
 
-            // Assert
+            // Assert: リンクと実体の両方が別エントリとして入り、リンク側は Symlink のまま
             assert_eq!(
                 archive_paths(&entries),
                 vec!["dir", "dir/link.txt", "dir/real.txt"]

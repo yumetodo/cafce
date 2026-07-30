@@ -155,6 +155,10 @@ pub fn to_checksum_base64(digest: &[u8; 32]) -> String {
 mod tests {
     use super::*;
 
+    /// 形式として妥当な内容ハッシュ（空文字列の SHA-256）
+    ///
+    /// 値そのものに意味は無く、「小文字 16 進 64 文字」であることだけが必要。
+    /// 既知の実在する digest を使うのは、テストが読み手に「これはハッシュだ」と伝わるため。
     const VALID_HASH: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 
     fn metadata_map(pairs: &[(&str, &str)]) -> std::collections::HashMap<String, String> {
@@ -183,7 +187,9 @@ mod tests {
             // Act
             let metadata = build_metadata(content_sha256);
 
-            // Assert
+            // Assert: 付与するのはこの 3 つだけ。増えると 2 KB 上限に近づくうえ、
+            // 古い cafce が読めない情報を増やすことになる。キー名の文字列も
+            // restore 側が引く名前と一致していなければ検証がまるごとスキップされる
             assert_eq!(metadata.len(), 3);
             assert_eq!(metadata.get(KEY_SCHEMA_VERSION).unwrap(), "1");
             assert_eq!(metadata.get(KEY_ARCHIVE_FORMAT).unwrap(), "tar+zstd");
@@ -192,13 +198,14 @@ mod tests {
 
         #[test]
         fn test_roundtrips_through_parse() {
-            // Arrange
+            // Arrange: store が付ける metadata そのもの
             let built = build_metadata(VALID_HASH);
 
-            // Act
+            // Act: restore と同じ経路で読み返す
             let parsed = parse_metadata(Some(&built)).unwrap().unwrap();
 
-            // Assert
+            // Assert: 書き手と読み手が同じ定数を使っていることの確認。
+            // 個別のキー名テストと違い、片方だけキー名を変えた退行をここで捕まえる
             assert_eq!(
                 parsed,
                 CacheMetadata {
@@ -211,13 +218,15 @@ mod tests {
 
         #[test]
         fn test_values_are_us_ascii_and_within_2kb() {
-            // Arrange: S3 の user metadata は US-ASCII かつ全体 2 KB 上限
+            // Arrange: S3 の user metadata は US-ASCII かつ全体 2 KB 上限。
+            // 非 ASCII を入れると SDK かサーバのどちらかで弾かれる
             let metadata = build_metadata(VALID_HASH);
 
             // Act
             let total_size: usize = metadata.iter().map(|(k, v)| k.len() + v.len()).sum();
 
-            // Assert
+            // Assert: 現状は 3 キーで 100 バイト強なので上限には遠いが、
+            // 将来キーを増やしたときに気づけるよう境界を明示しておく
             assert!(metadata.iter().all(|(k, v)| k.is_ascii() && v.is_ascii()));
             assert!(total_size < 2048, "total_size={total_size}");
         }
@@ -228,19 +237,21 @@ mod tests {
 
         #[test]
         fn test_none_metadata_is_absent() {
-            // Arrange
+            // Arrange: SDK は metadata そのものが無いとき None を返す
             let metadata = None;
 
             // Act
             let parsed = parse_metadata(metadata).unwrap();
 
-            // Assert
+            // Assert: エラーではなく「無い」として返す。呼び出し側が
+            // restore なら検証スキップ、store なら上書き、と使い分けられるようにするため
             assert_eq!(parsed, None);
         }
 
         #[test]
         fn test_empty_metadata_is_absent() {
-            // Arrange: cafce 以外が置いたオブジェクト
+            // Arrange: metadata のフィールド自体はあるが空。`aws s3 cp` で手置きした
+            // オブジェクトはこの形になる（サーバ実装によって None か空 map か揺れる）
             let metadata = metadata_map(&[]);
 
             // Act
@@ -252,13 +263,14 @@ mod tests {
 
         #[test]
         fn test_foreign_metadata_is_absent() {
-            // Arrange: cafce と無関係な metadata だけがある
+            // Arrange: 別のツールが自分用の metadata を付けて置いたオブジェクト
             let metadata = metadata_map(&[("some-other-tool", "1")]);
 
             // Act
             let parsed = parse_metadata(Some(&metadata)).unwrap();
 
-            // Assert
+            // Assert: 「metadata が空でない」ことを cafce のものと取り違えない。
+            // 判定は cafce-schema-version の有無だけで行う
             assert_eq!(parsed, None);
         }
 
@@ -278,7 +290,9 @@ mod tests {
 
         #[test]
         fn test_uppercase_keys_are_accepted() {
-            // Arrange: S3 互換サーバによる大文字小文字の揺れを想定する
+            // Arrange: 本物の S3 は取得時にキーを小文字化して返すが、S3 互換サーバが
+            // 送ったままの大文字小文字で返す可能性に備える。ここで取りこぼすと
+            // 「metadata が無い」と誤判定し、毎回再アップロードが走る
             let metadata = metadata_map(&[
                 ("Cafce-Schema-Version", "1"),
                 ("CAFCE-ARCHIVE-FORMAT", ARCHIVE_FORMAT),
@@ -294,14 +308,15 @@ mod tests {
 
         #[test]
         fn test_future_schema_version_is_error() {
-            // Arrange: 将来の版数のオブジェクトは黙って展開しない
+            // Arrange: 新しい cafce が置いたオブジェクトを古い cafce が引いた状況
             let mut metadata = valid_metadata();
             metadata.insert(KEY_SCHEMA_VERSION.to_string(), "2".to_string());
 
             // Act
             let result = parse_metadata(Some(&metadata));
 
-            // Assert
+            // Assert: 知らないレイアウトを推測で展開すると、作業ディレクトリを
+            // 壊したうえで検証も通らない。読めないと分かった時点で落とす
             assert!(matches!(
                 result,
                 Err(crate::error::CacheMetadataError::UnknownSchemaVersion {
@@ -313,14 +328,15 @@ mod tests {
 
         #[test]
         fn test_non_numeric_schema_version_is_error() {
-            // Arrange
+            // Arrange: 10 進整数として読めない版数（人手で書き換えた等）
             let mut metadata = valid_metadata();
             metadata.insert(KEY_SCHEMA_VERSION.to_string(), "v1".to_string());
 
             // Act
             let result = parse_metadata(Some(&metadata));
 
-            // Assert
+            // Assert: パース失敗を 0 や既定値に倒すと、壊れた metadata を
+            // 「版数 1 の正常なキャッシュ」として扱ってしまう
             assert!(matches!(
                 result,
                 Err(crate::error::CacheMetadataError::MalformedSchemaVersion { .. })
@@ -329,14 +345,15 @@ mod tests {
 
         #[test]
         fn test_unknown_archive_format_is_error() {
-            // Arrange
+            // Arrange: 版数は読めるが形式が違う（将来 zip を足した場合を想定）
             let mut metadata = valid_metadata();
             metadata.insert(KEY_ARCHIVE_FORMAT.to_string(), "zip".to_string());
 
             // Act
             let result = parse_metadata(Some(&metadata));
 
-            // Assert
+            // Assert: zstd デコーダに zip を食わせると分かりにくいエラーになるので、
+            // metadata の段階で形式違いとして落とす
             assert!(matches!(
                 result,
                 Err(crate::error::CacheMetadataError::UnknownArchiveFormat { .. })
@@ -345,7 +362,8 @@ mod tests {
 
         #[test]
         fn test_missing_archive_format_is_error() {
-            // Arrange: スキーマ版数があるのに形式が欠けているのは壊れたメタデータ
+            // Arrange: 版数はあるのに形式キーだけが無い。cafce が付けたなら 3 つ揃うので、
+            // 途中で書き換えられたか別実装が中途半端に真似た状態
             let mut metadata = valid_metadata();
             metadata.remove(KEY_ARCHIVE_FORMAT);
 
@@ -361,14 +379,15 @@ mod tests {
 
         #[test]
         fn test_short_content_hash_is_error() {
-            // Arrange
+            // Arrange: 16 進だが 64 文字に足りない
             let mut metadata = valid_metadata();
             metadata.insert(KEY_CONTENT_SHA256.to_string(), "abc123".to_string());
 
             // Act
             let result = parse_metadata(Some(&metadata));
 
-            // Assert
+            // Assert: 形式を検証せず通すと、比較が必ず不一致になって
+            // restore が「内容ハッシュ不一致」という誤った理由で落ちる
             assert!(matches!(
                 result,
                 Err(crate::error::CacheMetadataError::MalformedContentHash { .. })
@@ -377,7 +396,10 @@ mod tests {
 
         #[test]
         fn test_uppercase_content_hash_is_error() {
-            // Arrange: 値の形式は小文字 16 進に固定する（比較を単純な文字列一致に保つため）
+            // Arrange: 大文字 16 進。値としては同じダイジェストを表すが受け付けない。
+            // 比較を単純な文字列一致に保つため、揺れを入口で潰す
+            // （大文字を許すと照合側で正規化が必要になり、片方で忘れると
+            // 内容が同じでも毎回再アップロードが走る）
             let mut metadata = valid_metadata();
             metadata.insert(
                 KEY_CONTENT_SHA256.to_string(),
@@ -396,7 +418,7 @@ mod tests {
 
         #[test]
         fn test_non_hex_content_hash_is_error() {
-            // Arrange: 長さは 64 文字だが 16 進ではない
+            // Arrange: 長さは 64 文字あるので、長さだけを見る実装だと通ってしまう
             let mut metadata = valid_metadata();
             metadata.insert(KEY_CONTENT_SHA256.to_string(), "z".repeat(64));
 
@@ -412,14 +434,15 @@ mod tests {
 
         #[test]
         fn test_missing_content_hash_is_error() {
-            // Arrange
+            // Arrange: 版数と形式はあるが内容ハッシュだけ無い
             let mut metadata = valid_metadata();
             metadata.remove(KEY_CONTENT_SHA256);
 
             // Act
             let result = parse_metadata(Some(&metadata));
 
-            // Assert
+            // Assert: 欠落を空文字として扱うと形式検証に落ちる。
+            // 「cafce の metadata はあるが検証できない」を黙って通さない
             assert!(matches!(
                 result,
                 Err(crate::error::CacheMetadataError::MalformedContentHash { .. })
@@ -432,7 +455,7 @@ mod tests {
 
         #[test]
         fn test_matching_hashes_are_ok() {
-            // Arrange
+            // Arrange: metadata に記録された値と、展開しながら計算した値が一致する正常系
             let expected = VALID_HASH;
             let actual = VALID_HASH;
 
@@ -445,14 +468,17 @@ mod tests {
 
         #[test]
         fn test_mismatching_hashes_are_error() {
-            // Arrange
+            // Arrange: S3 上のオブジェクトが cafce 以外に書き換えられた、あるいは
+            // 古い cafce が別仕様で書いた場合に起こる
             let expected = VALID_HASH;
             let actual = "0".repeat(64);
 
             // Act
             let result = verify_content_sha256(expected, &actual);
 
-            // Assert
+            // Assert: cache miss として次の候補へ進めず、エラーにする。
+            // 壊れたキャッシュを踏んだまま CI が「なぜか遅い」状態を続けるのを避けるため
+            // （設計doc 代替案4）
             assert!(matches!(
                 result,
                 Err(crate::error::CacheMetadataError::ContentHashMismatch { .. })
@@ -461,7 +487,8 @@ mod tests {
 
         #[test]
         fn test_mismatch_error_mentions_partial_restore() {
-            // Arrange: 展開後にしか判明しないため、中途半端な木が残る旨を伝える必要がある
+            // Arrange: 転送破損は展開前に検出できるが、内容ハッシュの不一致は
+            // 展開し終わってからしか分からない。その時点でファイル木は書き換わっている
             let expected = VALID_HASH;
             let actual = "0".repeat(64);
 
@@ -470,7 +497,9 @@ mod tests {
                 .unwrap_err()
                 .to_string();
 
-            // Assert
+            // Assert: 利用者が復旧手順を判断できるよう、作業ディレクトリが汚れている
+            // 可能性をメッセージに含める（一時ディレクトリ経由の 2 段構えを採らず、
+            // 代わりに明示すると決めた。設計doc 代替案3）
             assert!(message.contains("中途半端に復元されたファイルが残っている可能性"));
         }
     }
@@ -480,20 +509,25 @@ mod tests {
 
         #[test]
         fn test_known_value_of_empty_sha256() {
-            // Arrange: 空文字列の SHA-256（既知値による回帰テスト）
+            // Arrange: 空文字列の SHA-256。この値は S3 のドキュメントにも出てくるため
+            // 期待値を独立に確認しやすい
             use sha2::Digest as _;
             let digest: [u8; 32] = sha2::Sha256::digest(b"").into();
 
             // Act
             let encoded = to_checksum_base64(&digest);
 
-            // Assert: `printf '' | sha256sum | xxd -r -p | base64` と一致する
+            // Assert: `printf '' | sha256sum | xxd -r -p | base64` と一致する。
+            // ここが 16 進を Base64 化した値（"ZTNiMGM0..."）になっていると、
+            // S3 は正しい本文でも BadDigest で拒否する。手元では気づけない類の間違いなので
+            // 既知値で固定する
             assert_eq!(encoded, "47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=");
         }
 
         #[test]
         fn test_known_value_of_test_content() {
-            // Arrange: hash_calculator の既知値テストと同じ入力を使う
+            // Arrange: hash_calculator の既知値テストと同じ入力。`+` と `/` を含む
+            // 出力になるため、URL-safe 変種（`-` と `_`）へ取り違えていれば分かる
             use sha2::Digest as _;
             let digest: [u8; 32] = sha2::Sha256::digest(b"test content").into();
 
@@ -506,19 +540,21 @@ mod tests {
 
         #[test]
         fn test_encoded_length_is_44() {
-            // Arrange: 32 バイトの Base64 は必ず 44 文字（パディング込み）
+            // Arrange: 中身によらず長さは一定になるはずなのでゼロ埋めで足りる
             let digest = [0u8; 32];
 
             // Act
             let encoded = to_checksum_base64(&digest);
 
-            // Assert
+            // Assert: 32 バイトの Base64 は必ず 44 文字（パディング込み）。
+            // 統合テストで S3 が返した値の長さを検査する際の根拠になる
             assert_eq!(encoded.len(), 44);
         }
 
         #[test]
         fn test_hex_and_base64_are_different_formats() {
-            // Arrange: metadata の 16 進と混同しないことを明示する
+            // Arrange: 同じ digest から 2 つの形式を作る。cafce は metadata に 16 進、
+            // S3 チェックサムに Base64 を送るので、取り違えると片方が必ず壊れる
             use sha2::Digest as _;
             let digest: [u8; 32] = sha2::Sha256::digest(b"test content").into();
             let hex = format!("{:x}", sha2::Sha256::digest(b"test content"));
