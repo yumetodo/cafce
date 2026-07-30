@@ -434,6 +434,73 @@ fn create_symlink(target: &std::path::Path, destination: &std::path::Path) -> an
     Ok(())
 }
 
+/// 既存のシンボリックリンクを消す
+///
+/// Unix の `unlink(2)` はリンク先の種別によらずシンボリックリンクを消せる。
+#[cfg(unix)]
+fn remove_symlink(path: &std::path::Path, _file_type: &std::fs::FileType) -> std::io::Result<()> {
+    std::fs::remove_file(path)
+}
+
+/// 既存のシンボリックリンクを消す
+///
+/// Windows の `remove_file` は `DeleteFileW` であり、**ディレクトリへのシンボリックリンクを
+/// 消せない**（`RemoveDirectoryW` が必要）。そのため種別で使い分ける。
+/// `remove_dir` はリンク自体（reparse point）を消すだけで、リンク先の中身には触らない。
+#[cfg(windows)]
+fn remove_symlink(path: &std::path::Path, file_type: &std::fs::FileType) -> std::io::Result<()> {
+    use std::os::windows::fs::FileTypeExt as _;
+
+    if file_type.is_symlink_dir() {
+        std::fs::remove_dir(path)
+    } else {
+        std::fs::remove_file(path)
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn remove_symlink(path: &std::path::Path, _file_type: &std::fs::FileType) -> std::io::Result<()> {
+    std::fs::remove_file(path)
+}
+
+/// シンボリックリンクを作る前に、同じパスにある既存のエントリを取り除く
+///
+/// `symlink(2)` も `CreateSymbolicLinkW` も、既存のパスに対しては失敗するため先に消す。
+///
+/// 実ディレクトリがあった場合だけはエラーにする。置き換えるには木ごと再帰削除するしかなく、
+/// cafce が作ったとは限らないディレクトリを黙って消すのは影響が大きすぎるためである
+/// （通常ファイル・ディレクトリのエントリでも、種別が食い違えば OS のエラーで落ちるので
+/// 挙動としては揃っている）。
+fn remove_existing_symlink_destination(path: &std::path::Path) -> anyhow::Result<()> {
+    use anyhow::Context as _;
+
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        // 存在しないなら何もしなくてよい
+        Err(_) => return Ok(()),
+    };
+    let file_type = metadata.file_type();
+
+    if file_type.is_symlink() {
+        return remove_symlink(path, &file_type).with_context(|| {
+            format!(
+                "既存のシンボリックリンクの削除に失敗しました: {}",
+                path.display()
+            )
+        });
+    }
+
+    if file_type.is_dir() {
+        return Err(crate::error::ArchiveError::SymlinkDestinationIsDirectory {
+            path: path.to_string_lossy().into_owned(),
+        }
+        .into());
+    }
+
+    std::fs::remove_file(path)
+        .with_context(|| format!("既存ファイルの削除に失敗しました: {}", path.display()))
+}
+
 /// 展開後に作るシンボリックリンク（作成先, リンク先）
 type DeferredSymlink = (std::path::PathBuf, std::path::PathBuf);
 
@@ -563,15 +630,7 @@ pub fn extract_archive(
                 format!("親ディレクトリの作成に失敗しました: {}", parent.display())
             })?;
         }
-        // 既存のリンク・ファイルがあると symlink(2) は EEXIST になるため先に消す
-        if std::fs::symlink_metadata(destination).is_ok() {
-            std::fs::remove_file(destination).with_context(|| {
-                format!(
-                    "既存ファイルの削除に失敗しました: {}",
-                    destination.display()
-                )
-            })?;
-        }
+        remove_existing_symlink_destination(destination)?;
         create_symlink(target, destination)?;
     }
 
@@ -1004,6 +1063,58 @@ mod tests {
             assert_eq!(
                 std::fs::read_link(dest_dir.path().join("link.txt")).unwrap(),
                 std::path::Path::new("real.txt")
+            );
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn test_extraction_overwrites_existing_symlink_to_directory() {
+            // Arrange: 既存がディレクトリへのリンクの場合。Windows では DeleteFileW で消せず
+            // RemoveDirectoryW が必要になるため、種別ごとに削除方法を分けている
+            let source_dir = tempfile::tempdir().unwrap();
+            std::fs::write(source_dir.path().join("real.txt"), "content").unwrap();
+            std::os::unix::fs::symlink("real.txt", source_dir.path().join("link")).unwrap();
+            let archive = build_from(source_dir.path(), &["real.txt", "link"]);
+
+            let dest_dir = tempfile::tempdir().unwrap();
+            std::fs::create_dir_all(dest_dir.path().join("stale_dir")).unwrap();
+            std::os::unix::fs::symlink("stale_dir", dest_dir.path().join("link")).unwrap();
+
+            // Act
+            extract_archive(archive.temp_file.path(), dest_dir.path()).unwrap();
+
+            // Assert: リンクは張り替わり、リンク先だったディレクトリは消されていない
+            assert_eq!(
+                std::fs::read_link(dest_dir.path().join("link")).unwrap(),
+                std::path::Path::new("real.txt")
+            );
+            assert!(dest_dir.path().join("stale_dir").is_dir());
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn test_extraction_fails_when_symlink_destination_is_real_directory() {
+            // Arrange: リンクを作る位置に実ディレクトリがある
+            let source_dir = tempfile::tempdir().unwrap();
+            std::fs::write(source_dir.path().join("real.txt"), "content").unwrap();
+            std::os::unix::fs::symlink("real.txt", source_dir.path().join("link")).unwrap();
+            let archive = build_from(source_dir.path(), &["real.txt", "link"]);
+
+            let dest_dir = tempfile::tempdir().unwrap();
+            std::fs::create_dir_all(dest_dir.path().join("link")).unwrap();
+            std::fs::write(dest_dir.path().join("link/precious.txt"), "do not delete").unwrap();
+
+            // Act
+            let result = extract_archive(archive.temp_file.path(), dest_dir.path());
+
+            // Assert: 黙って再帰削除せずエラーにし、中身を残す
+            assert!(result
+                .unwrap_err()
+                .to_string()
+                .contains("実ディレクトリがあります"));
+            assert_eq!(
+                std::fs::read_to_string(dest_dir.path().join("link/precious.txt")).unwrap(),
+                "do not delete"
             );
         }
 

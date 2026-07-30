@@ -41,6 +41,13 @@ pub enum ArchiveError {
     SymlinkEscapesBaseDirectory { path: String, target: String },
 
     #[error(
+        "シンボリックリンクを作る位置に実ディレクトリがあります: {path}\n\
+         置き換えるにはディレクトリを再帰削除する必要があり影響が大きいため、\
+         中身を確認して手で削除してください"
+    )]
+    SymlinkDestinationIsDirectory { path: String },
+
+    #[error(
         "アーカイブサイズが単一 PutObject の上限を超えています: {size} bytes > {limit} bytes\n\
          cafce はマルチパートアップロードに未対応です。paths を絞り込んでください"
     )]
