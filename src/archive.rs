@@ -377,24 +377,70 @@ fn create_symlink(target: &std::path::Path, destination: &std::path::Path) -> an
 
     std::os::unix::fs::symlink(target, destination).with_context(|| {
         format!(
-            "シンボリックリンクの作成に失敗しました: {}",
-            destination.display()
+            "シンボリックリンクの作成に失敗しました: {} -> {}",
+            destination.display(),
+            target.display()
         )
     })
 }
 
-#[cfg(not(unix))]
-fn create_symlink(_target: &std::path::Path, destination: &std::path::Path) -> anyhow::Result<()> {
+/// Windows でシンボリックリンクを作る
+///
+/// `CreateSymbolicLinkW` はリンク先がファイルかディレクトリかを作成時に指定する必要があり、
+/// Rust の `std` もそれを `symlink_file` / `symlink_dir` の 2 関数に分けている。そのため
+/// リンク先を解決して種別を判定する。この判定を成立させるために、呼び出し側は全エントリの
+/// 展開が終わってからシンボリックリンクを作る（`extract_archive` の遅延パス）。
+///
+/// 非昇格プロセスでも、開発者モードが有効なら作成できる。`std` が
+/// `SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE` を渡してくれるためである
+/// （フラグを解さない古い Windows では `std` 側がフラグ無しで再試行する）。
+/// 開発者モードでも `SeCreateSymbolicLinkPrivilege` でもない場合は作成できないため、
+/// 黙ってスキップせずエラーにする。中身が欠けたキャッシュを正常な復元として返すと、
+/// 後続のビルドが不可解な形で失敗するためである。
+#[cfg(windows)]
+fn create_symlink(target: &std::path::Path, destination: &std::path::Path) -> anyhow::Result<()> {
+    use anyhow::Context as _;
+
+    let resolved_target = match destination.parent() {
+        Some(link_dir) => link_dir.join(target),
+        None => target.to_path_buf(),
+    };
+
+    let result = if resolved_target.is_dir() {
+        std::os::windows::fs::symlink_dir(target, destination)
+    } else {
+        std::os::windows::fs::symlink_file(target, destination)
+    };
+
+    result.with_context(|| {
+        format!(
+            "シンボリックリンクの作成に失敗しました: {} -> {}\n\
+             Windows でシンボリックリンクを作るには、開発者モードを有効にするか、\n\
+             SeCreateSymbolicLinkPrivilege を持つ（管理者として実行する）必要があります",
+            destination.display(),
+            target.display()
+        )
+    })
+}
+
+#[cfg(not(any(unix, windows)))]
+fn create_symlink(target: &std::path::Path, destination: &std::path::Path) -> anyhow::Result<()> {
+    // シンボリックリンクを作る標準 API が無いプラットフォーム（wasm 等）
     log::warn!(
-        "この環境ではシンボリックリンクを復元できないためスキップします: {}",
-        destination.display()
+        "このプラットフォームにはシンボリックリンクを作る API が無いためスキップします: {} -> {}",
+        destination.display(),
+        target.display()
     );
     Ok(())
 }
 
+/// 展開後に作るシンボリックリンク（作成先, リンク先）
+type DeferredSymlink = (std::path::PathBuf, std::path::PathBuf);
+
 fn extract_one_entry<R: std::io::Read>(
     entry: &mut tar::Entry<'_, R>,
     base_path: &std::path::Path,
+    deferred_symlinks: &mut std::vec::Vec<DeferredSymlink>,
 ) -> anyhow::Result<()> {
     use anyhow::Context as _;
 
@@ -452,22 +498,10 @@ fn extract_one_entry<R: std::io::Read>(
                 })?
                 .into_owned();
             check_symlink_target(&destination, &target, base_path)?;
-
-            if let Some(parent) = destination.parent() {
-                std::fs::create_dir_all(parent).with_context(|| {
-                    format!("親ディレクトリの作成に失敗しました: {}", parent.display())
-                })?;
-            }
-            // 既存のリンク・ファイルがあると symlink(2) は EEXIST になるため先に消す
-            if std::fs::symlink_metadata(&destination).is_ok() {
-                std::fs::remove_file(&destination).with_context(|| {
-                    format!(
-                        "既存ファイルの削除に失敗しました: {}",
-                        destination.display()
-                    )
-                })?;
-            }
-            create_symlink(&target, &destination)?;
+            // 作成は全エントリの展開後にまとめて行う（Windows ではリンク先がファイルか
+            // ディレクトリかを作成時に指定する必要があり、tar のエントリ順では
+            // リンク先がまだ存在しないことがあるため）
+            deferred_symlinks.push((destination, target));
         }
         other => {
             log::warn!(
@@ -490,6 +524,10 @@ fn extract_one_entry<R: std::io::Read>(
 /// - リンク先が基準ディレクトリの外を指すシンボリックリンク
 ///
 /// 通常ファイル・ディレクトリ・シンボリックリンク以外のエントリ型はスキップして警告を出す。
+///
+/// シンボリックリンクはファイル・ディレクトリを全て展開し終えてから作る。Windows の
+/// `CreateSymbolicLinkW` はリンク先がファイルかディレクトリかを作成時に指定する必要があり、
+/// tar のエントリ順（パスのバイト列昇順）ではリンク先が後から現れることがあるためである。
 pub fn extract_archive(
     archive_path: &std::path::Path,
     base_path: &std::path::Path,
@@ -504,12 +542,13 @@ pub fn extract_archive(
     let mut archive = tar::Archive::new(HashingReader::new(decoder));
 
     let mut extracted_count: usize = 0;
+    let mut deferred_symlinks: std::vec::Vec<DeferredSymlink> = std::vec::Vec::new();
     for entry in archive
         .entries()
         .context("tar エントリの列挙に失敗しました")?
     {
         let mut entry = entry.context("tar エントリの読み出しに失敗しました")?;
-        extract_one_entry(&mut entry, base_path)?;
+        extract_one_entry(&mut entry, base_path, &mut deferred_symlinks)?;
         extracted_count += 1;
     }
 
@@ -518,7 +557,28 @@ pub fn extract_archive(
     std::io::copy(&mut hashing_reader, &mut std::io::sink())
         .context("tar ストリームの読み切りに失敗しました")?;
 
-    log::info!("アーカイブを展開しました: {extracted_count} エントリ");
+    for (destination, target) in &deferred_symlinks {
+        if let Some(parent) = destination.parent() {
+            std::fs::create_dir_all(parent).with_context(|| {
+                format!("親ディレクトリの作成に失敗しました: {}", parent.display())
+            })?;
+        }
+        // 既存のリンク・ファイルがあると symlink(2) は EEXIST になるため先に消す
+        if std::fs::symlink_metadata(destination).is_ok() {
+            std::fs::remove_file(destination).with_context(|| {
+                format!(
+                    "既存ファイルの削除に失敗しました: {}",
+                    destination.display()
+                )
+            })?;
+        }
+        create_symlink(target, destination)?;
+    }
+
+    log::info!(
+        "アーカイブを展開しました: {extracted_count} エントリ（うちシンボリックリンク {} 件）",
+        deferred_symlinks.len()
+    );
 
     Ok(to_hex(hashing_reader.hasher.finalize()))
 }
@@ -886,6 +946,63 @@ mod tests {
                 .is_symlink());
             assert_eq!(
                 std::fs::read_link(&restored_link).unwrap(),
+                std::path::Path::new("real.txt")
+            );
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn test_roundtrip_restores_symlink_to_directory() {
+            // Arrange: リンク名がリンク先より前にソートされる配置にする
+            // （tar のエントリ順ではリンク先ディレクトリがまだ存在しないタイミングで
+            // リンクが現れる。Windows は作成時にファイル/ディレクトリを指定する必要があり、
+            // 展開後にまとめて作る遅延パスが無いと種別を誤る）
+            let source_dir = tempfile::tempdir().unwrap();
+            let source_path = source_dir.path();
+            std::fs::create_dir_all(source_path.join("zdir")).unwrap();
+            std::fs::write(source_path.join("zdir/inner.txt"), "content").unwrap();
+            std::os::unix::fs::symlink("zdir", source_path.join("a-link")).unwrap();
+            let archive = build_from(source_path, &["a-link", "zdir"]);
+            let dest_dir = tempfile::tempdir().unwrap();
+
+            // Act
+            extract_archive(archive.temp_file.path(), dest_dir.path()).unwrap();
+
+            // Assert
+            let restored_link = dest_dir.path().join("a-link");
+            assert!(std::fs::symlink_metadata(&restored_link)
+                .unwrap()
+                .file_type()
+                .is_symlink());
+            assert_eq!(
+                std::fs::read_link(&restored_link).unwrap(),
+                std::path::Path::new("zdir")
+            );
+            // リンク経由でリンク先の中身に到達できる
+            assert_eq!(
+                std::fs::read_to_string(restored_link.join("inner.txt")).unwrap(),
+                "content"
+            );
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn test_extraction_overwrites_existing_symlink() {
+            // Arrange: 既存のリンクがあると symlink(2) は EEXIST になるため、
+            // 先に消してから作り直す必要がある
+            let source_dir = tempfile::tempdir().unwrap();
+            std::fs::write(source_dir.path().join("real.txt"), "content").unwrap();
+            std::os::unix::fs::symlink("real.txt", source_dir.path().join("link.txt")).unwrap();
+            let archive = build_from(source_dir.path(), &["real.txt", "link.txt"]);
+            let dest_dir = tempfile::tempdir().unwrap();
+            std::os::unix::fs::symlink("stale-target", dest_dir.path().join("link.txt")).unwrap();
+
+            // Act
+            extract_archive(archive.temp_file.path(), dest_dir.path()).unwrap();
+
+            // Assert
+            assert_eq!(
+                std::fs::read_link(dest_dir.path().join("link.txt")).unwrap(),
                 std::path::Path::new("real.txt")
             );
         }

@@ -194,6 +194,13 @@ Determinism is guaranteed **within one platform**. Windows cannot report the exe
 file that is `0o755` on Unix becomes `0o644` there and the hash differs. The only consequence is a
 redundant re-upload when runners of mixed OSes share a bucket; correctness is unaffected.
 
+Symlinks are archived as links (never followed) and restored as links on Windows too, via
+`CreateSymbolicLinkW`. Creating one there needs either **Developer Mode** enabled — which is
+enough for a non-elevated process, since Rust's `std` passes
+`SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE` — or the `SeCreateSymbolicLinkPrivilege` user
+right (running as Administrator). With neither, `restore` fails rather than silently producing an
+incomplete tree.
+
 `project` is an **operational** namespace, not a security boundary: any principal with write access to the bucket can write under any `{project}` value. For real multi-tenant isolation, use separate buckets, or restrict IAM policies to a specific prefix (e.g. `arn:aws:s3:::my-bucket/prefix/project/*`).
 
 ## S3 object metadata
