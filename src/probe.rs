@@ -8,16 +8,20 @@ pub fn build_object_key(prefix: Option<&str>, project: &str, cache_key: &str) ->
     }
 }
 
-/// head_object で S3 オブジェクトの存在を確認する
+/// head_object で S3 オブジェクトの存在を確認し、存在すれば user metadata を返す
 ///
-/// - 200 OK → Ok(true)
-/// - 404 NotFound → Ok(false)
+/// - 200 OK → Ok(Some(user metadata))。metadata が付いていないオブジェクトは空の map になる
+/// - 404 NotFound → Ok(None)
 /// - 403 AccessDenied / その他エラー → Err（後続 fallback は試さない）
-async fn check_key_exists(
+///
+/// `probe` は存在の有無だけを見るが、`store` は返った metadata の
+/// `cafce-content-sha256` を再アップロードの要否判定に使う（設計doc 6.8）。
+/// 404 / 403 の扱いを 1 箇所に閉じ込めるため、両者でこの関数を共用する。
+pub async fn head_object_metadata(
     client: &aws_sdk_s3::Client,
     bucket: &str,
     object_key: &str,
-) -> anyhow::Result<bool> {
+) -> anyhow::Result<Option<std::collections::HashMap<String, String>>> {
     use aws_sdk_s3::error::SdkError;
     use aws_sdk_s3::operation::head_object::HeadObjectError;
 
@@ -28,9 +32,9 @@ async fn check_key_exists(
         .send()
         .await
     {
-        Ok(_) => Ok(true),
+        Ok(output) => Ok(Some(output.metadata().cloned().unwrap_or_default())),
         Err(SdkError::ServiceError(e)) if matches!(e.err(), HeadObjectError::NotFound(_)) => {
-            Ok(false)
+            Ok(None)
         }
         Err(e) => {
             use anyhow::Context as _;
@@ -55,19 +59,22 @@ pub async fn probe(
     client: &aws_sdk_s3::Client,
     base_path: &std::path::Path,
 ) -> anyhow::Result<bool> {
-    use anyhow::Context as _;
+    // restore と同じ順序・同じ解決経路を通す（設計doc 6.9 の不変条件）
+    let cache_keys = setting.resolve_key_candidates(base_path)?;
 
-    let primary_key = setting
-        .resolve_primary_key(base_path)
-        .context("primary キーの計算に失敗しました")?;
-
-    for cache_key in std::iter::once(&primary_key).chain(setting.fallback_keys.iter()) {
+    for cache_key in &cache_keys {
         let object_key = build_object_key(env.s3_prefix(), &setting.project, cache_key);
-        if check_key_exists(client, env.bucket(), &object_key).await? {
+        log::debug!("HeadObject を発行します: {object_key}");
+        if head_object_metadata(client, env.bucket(), &object_key)
+            .await?
+            .is_some()
+        {
+            log::info!("キャッシュがヒットしました: {object_key}");
             return Ok(true);
         }
     }
 
+    log::info!("全てのキー候補が miss しました: {cache_keys:?}");
     Ok(false)
 }
 

@@ -23,6 +23,17 @@ pub struct Key {
 #[serde(deny_unknown_fields)]
 pub struct Setting {
     pub project: String,
+
+    /// `store` がキャッシュするファイル/ディレクトリの glob パターン列
+    ///
+    /// - 基準ディレクトリはカレントディレクトリ（`key.files` と同じ基準）
+    /// - ファイル・ディレクトリ・ワイルドカード（`*`, `**`, `?`, `[...]`）を指定できる
+    /// - ディレクトリは再帰的に配下全体が対象になる
+    /// - 絶対パス・基準ディレクトリ外への脱出はエラー
+    /// - `${VAR}` 展開は行わない（ファイルシステムパスは展開対象外）
+    /// - `store` では空配列・0 件マッチをエラーにする。`restore` は参照しない
+    ///
+    /// 実際の解決とバリデーションは `crate::path_matcher::resolve_paths` が担う。
     #[serde(default)]
     pub paths: Vec<String>,
     pub key: serde_either::StringOrStruct<Key>,
@@ -119,6 +130,27 @@ impl Setting {
                 generator.generate_key(k)
             }
         }
+    }
+
+    /// primary キーと `fallback_keys` を順に並べたキー候補列を返す
+    ///
+    /// `probe` と `restore` が同じ順序・同じ解決経路を通ることで、
+    /// 「`probe` が `true` を返す状況では `restore` も必ずヒットする」という
+    /// 不変条件を保つ。`store` は書き込み先が常に primary キーなのでこれを使わない。
+    pub fn resolve_key_candidates(
+        &self,
+        base_path: &std::path::Path,
+    ) -> anyhow::Result<std::vec::Vec<String>> {
+        use anyhow::Context as _;
+
+        let primary_key = self
+            .resolve_primary_key(base_path)
+            .context("primary キーの計算に失敗しました")?;
+
+        let mut candidates = std::vec::Vec::with_capacity(1 + self.fallback_keys.len());
+        candidates.push(primary_key);
+        candidates.extend(self.fallback_keys.iter().cloned());
+        Ok(candidates)
     }
 }
 
@@ -458,6 +490,139 @@ key = { files = ["${CAFCE_TEST_GLOB_VAR}/*.lock"] }
                 }
                 _ => panic!("expected Struct form"),
             }
+        }
+    }
+
+    mod paths_tests {
+        use super::*;
+
+        #[test]
+        fn test_paths_accepts_multiple_glob_patterns() {
+            // Arrange: ディレクトリ名・ワイルドカード・別ディレクトリを混ぜる。
+            // key.files と違い件数上限が無いので、複数書けること自体を固定する
+            let toml = r#"
+project = "my-app"
+key = "cache-v1"
+paths = ["target", "**/*.lock", "node_modules"]
+"#;
+
+            // Act
+            let result = Setting::new_from_str(toml);
+
+            // Assert: 順序も含めて書いたままパースされる（解決とバリデーションは
+            // path_matcher の責務なので、ここでは値の受け渡しだけを見る）
+            let setting = result.unwrap();
+            assert_eq!(setting.paths, vec!["target", "**/*.lock", "node_modules"]);
+        }
+
+        #[test]
+        fn test_paths_are_not_expanded() {
+            // Arrange: project や key とは扱いが違い、paths は ${VAR} 展開しない。
+            // 展開してしまうと、キャッシュ対象が実行環境によって変わり
+            // store と restore で食い違う余地が生まれる（#6 で確定済みの方針）
+            std::env::set_var("CAFCE_TEST_PATHS_VAR", "should-not-expand");
+            let toml = r#"
+project = "my-app"
+key = "cache-v1"
+paths = ["${CAFCE_TEST_PATHS_VAR}/target"]
+"#;
+
+            // Act
+            let result = Setting::new_from_str(toml);
+
+            // Assert: 変数が定義済みでも展開されず、リテラルのまま残る
+            let setting = result.unwrap();
+            assert_eq!(setting.paths, vec!["${CAFCE_TEST_PATHS_VAR}/target"]);
+        }
+
+        #[test]
+        fn test_paths_omitted_defaults_to_empty() {
+            // Arrange: paths を書かない config（key / probe だけを使う運用では正当）
+            let toml = r#"
+project = "my-app"
+key = "cache-v1"
+"#;
+
+            // Act
+            let result = Setting::new_from_str(toml);
+
+            // Assert: パース時点ではエラーにしない。store を実行したときに
+            // path_matcher が空を弾く、という分担にしている
+            assert!(result.unwrap().paths.is_empty());
+        }
+    }
+
+    mod resolve_key_candidates_tests {
+        use super::*;
+
+        #[test]
+        fn test_primary_only_when_no_fallback() {
+            // Arrange: fallback_keys を書かない config
+            let setting = Setting::new_from_str(
+                r#"
+project = "my-app"
+key = "cache-v1"
+"#,
+            )
+            .unwrap();
+
+            // Act
+            let candidates = setting
+                .resolve_key_candidates(std::path::Path::new("."))
+                .unwrap();
+
+            // Assert: primary だけの 1 要素になる。空や 0 要素になると
+            // probe / restore が何も試さず必ず miss する
+            assert_eq!(candidates, vec!["cache-v1"]);
+        }
+
+        #[test]
+        fn test_primary_comes_first_then_fallbacks_in_order() {
+            // Arrange: feature ブランチ → main → 既定、という典型的な優先順位
+            let setting = Setting::new_from_str(
+                r#"
+project = "my-app"
+key = "cache-feature"
+fallback_keys = ["cache-main", "cache-default"]
+"#,
+            )
+            .unwrap();
+
+            // Act
+            let candidates = setting
+                .resolve_key_candidates(std::path::Path::new("."))
+                .unwrap();
+
+            // Assert: primary が先頭で、fallback_keys は config に書いた順のまま。
+            // この並びが probe と restore の共通の試行順になるため、
+            // 入れ替わると「probe は true なのに restore が別のキャッシュを引く」が起きる
+            assert_eq!(
+                candidates,
+                vec!["cache-feature", "cache-main", "cache-default"]
+            );
+        }
+
+        #[test]
+        fn test_files_based_key_is_computed_as_primary() {
+            // Arrange: key が files 形態の場合。literal String と違い primary は
+            // 計算結果になる。ここでは files が 0 件マッチなので、
+            // GitLab CI 互換の default フォールバックが効く
+            let temp_dir = tempfile::tempdir().unwrap();
+            let setting = Setting::new_from_str(
+                r#"
+project = "my-app"
+key = { files = ["does-not-exist.lock"], prefix = "deps" }
+fallback_keys = ["cache-main"]
+"#,
+            )
+            .unwrap();
+
+            // Act
+            let candidates = setting.resolve_key_candidates(temp_dir.path()).unwrap();
+
+            // Assert: 先頭は計算済みの文字列（prefix 付き）で、fallback_keys は
+            // そのまま後ろに続く。計算経路が resolve_primary_key と共通であることの確認
+            assert_eq!(candidates, vec!["deps-default", "cache-main"]);
         }
     }
 

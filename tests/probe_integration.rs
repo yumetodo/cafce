@@ -10,14 +10,16 @@
 #[cfg(test)]
 mod probe_integration_tests {
     fn rustfs_env(bucket: &str) -> cafce::env::Env {
-        cafce::env::Env::new_for_test_with_bucket(
-            Some("localhost:9000".to_string()),
-            Some("cafce-dev-access-key".to_string()),
-            Some("cafce-dev-secret-key".to_string()),
-            true,
-            bucket.to_string(),
-            None,
-        )
+        cafce::env::Env::new_for_test_with_bucket(cafce::env::TestEnvParams {
+            server_address: Some("localhost:9000".to_string()),
+            access_key: Some("cafce-dev-access-key".to_string()),
+            secret_key: Some("cafce-dev-secret-key".to_string()),
+            insecure: true,
+            region: None,
+            bucket: bucket.to_string(),
+            s3_prefix: None,
+            s3_checksum: cafce::env::S3ChecksumMode::Auto,
+        })
     }
 
     fn unique_name(prefix: &str) -> String {

@@ -17,6 +17,22 @@ pub enum EnvError {
     MissingBucket,
 }
 
+/// S3 フレキシブルチェックサム（`x-amz-checksum-sha256`）の使い方
+///
+/// AWS S3 の拡張機能であり S3 互換サーバの対応状況はまちまちなため、
+/// 既定は「使えるなら使う」ベストエフォートとする。
+#[derive(serde::Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum S3ChecksumMode {
+    /// 使えるなら使う。非対応に起因すると判断できる失敗はチェックサム無しで 1 回だけ再試行する
+    Auto,
+    /// チェックサムを付けない。`restore` でも `checksum_mode` を指定しない
+    Off,
+    /// フォールバックしない。`store` の失敗はそのままエラー。
+    /// `restore` でサーバがチェックサムを返さなかった場合もエラーにする
+    Required,
+}
+
 fn default_insecure() -> bool {
     false
 }
@@ -25,7 +41,11 @@ fn default_force_path_style() -> Option<bool> {
     None
 }
 
-#[derive(serde::Deserialize, Debug)]
+fn default_s3_checksum() -> S3ChecksumMode {
+    S3ChecksumMode::Auto
+}
+
+#[derive(serde::Deserialize)]
 pub struct Env {
     /// S3互換サーバーのアドレス
     /// 例: "s3.amazonaws.com", "localhost:9000", "10.200.1.157:9000"
@@ -77,6 +97,38 @@ pub struct Env {
 
     /// S3オブジェクトキーの先頭に付ける任意のprefix（末尾スラッシュは正規化）
     s3_prefix: Option<String>,
+
+    /// S3フレキシブルチェックサムの挙動（auto / off / required）
+    #[serde(default = "default_s3_checksum")]
+    s3_checksum: S3ChecksumMode,
+}
+
+/// 資格情報をCIログへ露出させないための手書き`Debug`実装
+///
+/// アクセスキー・シークレットキー・セッショントークンは固定文字列に置き換える。
+/// 値の有無だけは診断のため区別できるよう、`None`は`None`のまま表示する。
+impl std::fmt::Debug for Env {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        fn redact(value: &Option<String>) -> Option<&'static str> {
+            value.as_ref().map(|_| "***")
+        }
+
+        f.debug_struct("Env")
+            .field("aws_server_address", &self.aws_server_address)
+            .field("aws_access_key", &redact(&self.aws_access_key))
+            .field("aws_secret_key", &redact(&self.aws_secret_key))
+            .field("aws_session_token", &redact(&self.aws_session_token))
+            .field("aws_role_arn", &self.aws_role_arn)
+            .field("aws_role_session_name", &self.aws_role_session_name)
+            .field("aws_profile", &self.aws_profile)
+            .field("aws_insecure", &self.aws_insecure)
+            .field("aws_region", &self.aws_region)
+            .field("aws_force_path_style", &self.aws_force_path_style)
+            .field("aws_bucket", &self.aws_bucket)
+            .field("s3_prefix", &self.s3_prefix)
+            .field("s3_checksum", &self.s3_checksum)
+            .finish()
+    }
 }
 
 fn normalize_s3_prefix(prefix: Option<String>) -> Option<String> {
@@ -111,6 +163,11 @@ impl Env {
 
     pub fn s3_prefix(&self) -> Option<&str> {
         self.s3_prefix.as_deref()
+    }
+
+    /// S3フレキシブルチェックサムの挙動を取得する
+    pub fn s3_checksum(&self) -> S3ChecksumMode {
+        self.s3_checksum
     }
 
     /// サーバーアドレスからエンドポイントURLを生成する
@@ -265,33 +322,44 @@ impl Env {
             aws_force_path_style: force_path_style,
             aws_bucket: None,
             s3_prefix: None,
+            s3_checksum: default_s3_checksum(),
         }
     }
 
     #[doc(hidden)]
-    pub fn new_for_test_with_bucket(
-        server_address: Option<String>,
-        access_key: Option<String>,
-        secret_key: Option<String>,
-        insecure: bool,
-        bucket: String,
-        s3_prefix: Option<String>,
-    ) -> Self {
+    pub fn new_for_test_with_bucket(params: TestEnvParams) -> Self {
         Self {
-            aws_server_address: server_address,
-            aws_access_key: access_key,
-            aws_secret_key: secret_key,
+            aws_server_address: params.server_address,
+            aws_access_key: params.access_key,
+            aws_secret_key: params.secret_key,
             aws_session_token: None,
             aws_role_arn: None,
             aws_role_session_name: None,
             aws_profile: None,
-            aws_insecure: insecure,
-            aws_region: None,
+            aws_insecure: params.insecure,
+            aws_region: params.region,
             aws_force_path_style: None,
-            aws_bucket: Some(bucket),
-            s3_prefix,
+            aws_bucket: Some(params.bucket),
+            s3_prefix: params.s3_prefix,
+            s3_checksum: params.s3_checksum,
         }
     }
+}
+
+/// `Env::new_for_test_with_bucket` に渡すパラメータ
+///
+/// 統合テスト（`tests/` 配下）から `Env` を組み立てるための入口。項目数が多く
+/// 位置引数では取り違えやすいため、Parameter struct として受け取る。
+#[doc(hidden)]
+pub struct TestEnvParams {
+    pub server_address: Option<String>,
+    pub access_key: Option<String>,
+    pub secret_key: Option<String>,
+    pub insecure: bool,
+    pub region: Option<String>,
+    pub bucket: String,
+    pub s3_prefix: Option<String>,
+    pub s3_checksum: S3ChecksumMode,
 }
 
 #[cfg(test)]
@@ -317,6 +385,186 @@ mod tests {
             aws_force_path_style: force_path_style,
             aws_bucket: None,
             s3_prefix: None,
+            s3_checksum: default_s3_checksum(),
+        }
+    }
+
+    mod redacted_debug_tests {
+        use super::*;
+
+        /// redact 対象の 3 フィールドが実際に埋まった `Env` を作る
+        ///
+        /// 値は AWS のドキュメントに載っているサンプル資格情報で、本物ではない。
+        /// 「redact されていれば Debug 出力に 1 文字も現れない」ことを部分一致で
+        /// 検査したいので、他のフィールドと偶然衝突しない特徴的な文字列を選んでいる。
+        fn create_env_with_secrets() -> Env {
+            Env {
+                aws_access_key: Some("AKIAIOSFODNN7EXAMPLE".to_string()),
+                aws_secret_key: Some("wJalrXUtnFEMI-K7MDENG-bPxRfiCYEXAMPLEKEY".to_string()),
+                aws_session_token: Some("FwoGZXIvYXdzEXAMPLESESSIONTOKEN".to_string()),
+                ..create_test_env(Some("localhost:9000"), true, None, None)
+            }
+        }
+
+        #[test]
+        fn test_debug_does_not_contain_access_key() {
+            // Arrange: アクセスキーが設定された Env
+            let env = create_env_with_secrets();
+
+            // Act: CI ログへ流れるのと同じ経路（Debug 出力）を文字列として取る
+            let debug_output = format!("{env:?}");
+
+            // Assert: #6 で申し送られた「アクセスキーが stdout へ露出する」不具合の再発防止。
+            // 値そのものが 1 箇所も現れてはならない
+            assert!(!debug_output.contains("AKIAIOSFODNN7EXAMPLE"));
+        }
+
+        #[test]
+        fn test_debug_does_not_contain_secret_key() {
+            // Arrange: シークレットキーが設定された Env
+            let env = create_env_with_secrets();
+
+            // Act
+            let debug_output = format!("{env:?}");
+
+            // Assert: 3 フィールドを個別のテストに分けているのは、
+            // 1 つだけ redact を書き忘れた退行を取り違えなく検出したいため
+            assert!(!debug_output.contains("wJalrXUtnFEMI-K7MDENG-bPxRfiCYEXAMPLEKEY"));
+        }
+
+        #[test]
+        fn test_debug_does_not_contain_session_token() {
+            // Arrange: セッショントークンが設定された Env
+            let env = create_env_with_secrets();
+
+            // Act
+            let debug_output = format!("{env:?}");
+
+            // Assert
+            assert!(!debug_output.contains("FwoGZXIvYXdzEXAMPLESESSIONTOKEN"));
+        }
+
+        #[test]
+        fn test_debug_alternate_form_does_not_contain_secrets() {
+            // Arrange: 露出していた仮実装は `{env:#?}`（pretty 形式）を使っていた
+            let env = create_env_with_secrets();
+
+            // Act: `{:?}` と `{:#?}` は同じ `Debug::fmt` を通るが、
+            // 手書き実装で分岐を書き間違えると片方だけ漏れうるため両方を検査する
+            let debug_output = format!("{env:#?}");
+
+            // Assert
+            assert!(!debug_output.contains("AKIAIOSFODNN7EXAMPLE"));
+            assert!(!debug_output.contains("wJalrXUtnFEMI-K7MDENG-bPxRfiCYEXAMPLEKEY"));
+            assert!(!debug_output.contains("FwoGZXIvYXdzEXAMPLESESSIONTOKEN"));
+        }
+
+        #[test]
+        fn test_debug_shows_redaction_placeholder_when_set() {
+            // Arrange: 資格情報あり
+            let env = create_env_with_secrets();
+
+            // Act
+            let debug_output = format!("{env:?}");
+
+            // Assert: フィールドをまるごと消すのではなく `Some("***")` に置き換える。
+            // 「設定されているが伏せた」と「未設定」を診断で読み分けられるようにするためで、
+            // 次のテスト（未設定は None のまま）と対で意味を持つ
+            assert!(debug_output.contains("aws_access_key: Some(\"***\")"));
+            assert!(debug_output.contains("aws_secret_key: Some(\"***\")"));
+            assert!(debug_output.contains("aws_session_token: Some(\"***\")"));
+        }
+
+        #[test]
+        fn test_debug_shows_none_for_unset_credentials() {
+            // Arrange: 資格情報が 1 つも設定されていない Env
+            let env = create_test_env(Some("localhost:9000"), true, None, None);
+
+            // Act
+            let debug_output = format!("{env:?}");
+
+            // Assert: 未設定を `Some("***")` に潰してしまうと
+            // 「キーを渡し忘れた」のか「渡したが伏せられた」のか区別できなくなる
+            assert!(debug_output.contains("aws_access_key: None"));
+            assert!(debug_output.contains("aws_secret_key: None"));
+            assert!(debug_output.contains("aws_session_token: None"));
+        }
+
+        #[test]
+        fn test_debug_keeps_non_secret_fields_visible() {
+            // Arrange: エンドポイントは "localhost:9000" にしてある
+            let env = create_env_with_secrets();
+
+            // Act
+            let debug_output = format!("{env:?}");
+
+            // Assert: 安全側に振り切って全フィールドを伏せると Debug 実装を残す意味が無い。
+            // 接続先のような非機密フィールドは診断のためそのまま見えること
+            assert!(debug_output.contains("localhost:9000"));
+        }
+    }
+
+    mod s3_checksum_tests {
+        use super::*;
+
+        #[test]
+        fn test_default_is_auto() {
+            // Arrange: CAFCE_S3_CHECKSUM を設定していない環境を模した Env
+            let env = create_test_env(None, false, None, None);
+
+            // Act
+            let mode = env.s3_checksum();
+
+            // Assert: 既定はベストエフォート。ここが Off に退行すると
+            // 何も設定していない利用者のチェックサム検証が黙って外れる
+            assert_eq!(mode, S3ChecksumMode::Auto);
+        }
+
+        #[test]
+        fn test_deserialize_lowercase_values() {
+            // Arrange: 環境変数として渡される 3 値。README に小文字で書いているため、
+            // `#[serde(rename_all = "lowercase")]` が外れていないことを固定する
+            let inputs = [
+                ("\"auto\"", S3ChecksumMode::Auto),
+                ("\"off\"", S3ChecksumMode::Off),
+                ("\"required\"", S3ChecksumMode::Required),
+            ];
+
+            for (json, expected) in inputs {
+                // Act
+                let parsed: S3ChecksumMode =
+                    parse_checksum_mode(json).expect("既知の値はパースできるはず");
+
+                // Assert
+                assert_eq!(parsed, expected, "input={json}");
+            }
+        }
+
+        #[test]
+        fn test_deserialize_unknown_value_is_error() {
+            // Arrange: `off` のつもりで書きそうな綴り違い
+            let json = "\"yes\"";
+
+            // Act
+            let parsed = parse_checksum_mode(json);
+
+            // Assert: 未知の値を既定値へ黙って倒すと、`required` を指定したつもりで
+            // 検証が外れている状態に気づけない。設定ミスは起動時に落とす
+            assert!(parsed.is_err());
+        }
+
+        /// 引用符付きの値 1 つを `S3ChecksumMode` としてデシリアライズする
+        ///
+        /// 本番の入力経路は envy（環境変数）だが、envy はプロセス全体の環境変数を読むため
+        /// 単体テストから 1 値だけを与えられない。`serde_json` は依存に無いので、
+        /// 同じ `Deserialize` 実装を通せる TOML の value として読ませている。
+        fn parse_checksum_mode(quoted: &str) -> Result<S3ChecksumMode, toml::de::Error> {
+            let doc = format!("value = {quoted}");
+            #[derive(serde::Deserialize)]
+            struct Wrapper {
+                value: S3ChecksumMode,
+            }
+            toml::from_str::<Wrapper>(&doc).map(|w| w.value)
         }
     }
 

@@ -8,7 +8,7 @@ struct Opts {
 
 #[derive(Debug, Clone, bpaf::Bpaf)]
 enum Action {
-    /// Store files to the cache (not yet implemented)
+    /// Store the configured paths into the cache (outputs "true" when uploaded)
     #[bpaf(command)]
     Store {
         /// Path to the configuration file
@@ -16,7 +16,7 @@ enum Action {
         config: std::path::PathBuf,
     },
 
-    /// Restore files from the cache (not yet implemented)
+    /// Restore files from the cache (outputs "true" when extracted)
     #[bpaf(command)]
     Restore {
         /// Path to the configuration file
@@ -98,23 +98,31 @@ async fn run(opts: Opts) -> anyhow::Result<()> {
         }
 
         Action::Store { config } => {
-            let env = cafce::env::Env::new().context("環境変数の読み込みに失敗しました")?;
+            let cwd =
+                std::env::current_dir().context("カレントディレクトリの取得に失敗しました")?;
             let setting = cafce::setting::Setting::new_from_file(&config).with_context(|| {
                 format!("設定ファイルの読み込みに失敗しました: {}", config.display())
             })?;
-            println!("{config:#?}");
-            println!("{env:#?}");
-            println!("{setting:#?}");
+            let env = cafce::env::Env::new().context("環境変数の読み込みに失敗しました")?;
+            let client = cafce::s3_client::build_s3_client(&env)
+                .await
+                .context("S3 クライアントの構築に失敗しました")?;
+            let uploaded = cafce::store::store(&setting, &env, &client, &cwd).await?;
+            println!("{}", if uploaded { "true" } else { "false" });
         }
 
         Action::Restore { config } => {
-            let env = cafce::env::Env::new().context("環境変数の読み込みに失敗しました")?;
+            let cwd =
+                std::env::current_dir().context("カレントディレクトリの取得に失敗しました")?;
             let setting = cafce::setting::Setting::new_from_file(&config).with_context(|| {
                 format!("設定ファイルの読み込みに失敗しました: {}", config.display())
             })?;
-            println!("{config:#?}");
-            println!("{env:#?}");
-            println!("{setting:#?}");
+            let env = cafce::env::Env::new().context("環境変数の読み込みに失敗しました")?;
+            let client = cafce::s3_client::build_s3_client(&env)
+                .await
+                .context("S3 クライアントの構築に失敗しました")?;
+            let restored = cafce::restore::restore(&setting, &env, &client, &cwd).await?;
+            println!("{}", if restored { "true" } else { "false" });
         }
     }
 
